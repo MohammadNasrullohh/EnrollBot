@@ -68,6 +68,7 @@ const uint16_t TOUCH_DOUBLE_TAP_MS = 330;
 const uint8_t REMINDER_TEXT_MAX = 32;
 const uint8_t REMINDER_MAX_SLOTS = 5;
 const uint8_t REMINDER_SERIAL_MAX = 220;
+const unsigned long LOVE_STORY_DURATION_MS = 236000UL;
 const long GMT_OFFSET_SEC = 7L * 3600L;
 const int DAYLIGHT_OFFSET_SEC = 0;
 
@@ -277,10 +278,12 @@ bool geminiActive = false;
 String geminiStatus = "AI OFF";
 bool webIpShown = false;
 bool mpuAdafruitReady = false;
+bool loveStoryActive = false;
 uint8_t mpuI2cAddress = 0x68;
 uint8_t foundI2cAddrs[8];
 uint8_t foundI2cCount = 0;
 unsigned long lastI2cScanMs = 0UL;
+unsigned long loveStoryStartedMs = 0UL;
 uint8_t webFrame[SCREEN_WIDTH * SCREEN_HEIGHT / 8];
 bool webFrameActive = false;
 unsigned long lastWebFrameMs = 0UL;
@@ -375,6 +378,8 @@ void setReminderText(const char* text);
 void setReminderSchedule(const char* payload, unsigned long now);
 void setReminderSlots(const char* payload, unsigned long now);
 void startSelectedGame(unsigned long now);
+void stopLoveStoryMode();
+void startLoveStoryMode(unsigned long now);
 
 bool secretsConfigured() {
   return strcmp(WIFI_SSID, "NAMA_WIFI_KAMU") != 0 &&
@@ -959,12 +964,14 @@ void handleWebFrame() {
     webFrame[i] = (uint8_t)((hi << 4) | lo);
   }
 
+  stopLoveStoryMode();
   webFrameActive = true;
   lastWebFrameMs = millis();
   webServer.send(200, "text/plain", "Muncul di OLED");
 }
 
 void handleWebClear() {
+  stopLoveStoryMode();
   webFrameActive = false;
   webServer.send(200, "text/plain", "Balik ke wajah");
 }
@@ -990,6 +997,42 @@ void renderWebFrame(unsigned long now) {
 void setupWebServer() {}
 void renderWebFrame(unsigned long now) { (void)now; }
 #endif
+
+unsigned long loveStoryElapsed(unsigned long now) {
+  return loveStoryActive ? now - loveStoryStartedMs : 0UL;
+}
+
+void stopLoveStoryMode() {
+  loveStoryActive = false;
+}
+
+void startLoveStoryMode(unsigned long now) {
+  loveStoryActive = true;
+  loveStoryStartedMs = now;
+  webFrameActive = false;
+  activeScreen = SCREEN_FACE;
+  menuUntilMs = 0UL;
+  pendingAngryAtMs = 0UL;
+  poseReady = false;
+  webCommand = "LOVE STORY";
+  webCommandUntilMs = now + 1600UL;
+}
+
+Mood loveStoryTimelineMood(unsigned long elapsed) {
+  if (elapsed < 11000UL) return MOOD_DREAMY;
+  if (elapsed < 23000UL) return MOOD_SHY;
+  if (elapsed < 36000UL) return (elapsed / 900UL) % 2 ? MOOD_LOVE : MOOD_WINK;
+  if (elapsed < 52000UL) return MOOD_DETERMINED;
+  if (elapsed < 72000UL) return (elapsed / 1150UL) % 2 ? MOOD_EXCITED : MOOD_DANCE;
+  if (elapsed < 92000UL) return MOOD_LOVE;
+  if (elapsed < 112000UL) return (elapsed / 1300UL) % 2 ? MOOD_SMIRK : MOOD_SHY;
+  if (elapsed < 136000UL) return MOOD_WORRIED;
+  if (elapsed < 156000UL) return (elapsed / 900UL) % 2 ? MOOD_SURPRISED : MOOD_DETERMINED;
+  if (elapsed < 178000UL) return MOOD_HEART_POP;
+  if (elapsed < 205000UL) return (elapsed / 1050UL) % 2 ? MOOD_HAPPY : MOOD_LOVE;
+  if (elapsed < 226000UL) return MOOD_PROUD;
+  return MOOD_PLEASED;
+}
 
 void updateSerialFrame(unsigned long now) {
 #if SERIAL_FRAME_MODE
@@ -1076,43 +1119,55 @@ void updateSerialFrame(unsigned long now) {
     if (!serialFrameReceiving) {
       if (b == 'C') {
         Serial.println("CMD C clear");
+        stopLoveStoryMode();
         webFrameActive = false;
       } else if (b == 'M') {
         Serial.println("CMD M menu");
+        stopLoveStoryMode();
         showMenu(MENU_TEMP_CHECK, now);
       } else if (b == 'R') {
         Serial.println("CMD R reminder");
+        stopLoveStoryMode();
         toggleReminder(now);
         showMenu(MENU_REMINDER, now);
       } else if (b == 'T') {
         Serial.println("CMD T temp");
+        stopLoveStoryMode();
         showTempScreen(now);
       } else if (b == 'G') {
         Serial.println("CMD G game");
+        stopLoveStoryMode();
         webFrameActive = false;
         showMinigameScreen(now);
       } else if (b == '1') {
         Serial.println("CMD 1 pingpong");
+        stopLoveStoryMode();
         webFrameActive = false;
         activeScreen = SCREEN_MINIGAME;
         selectedGame = GAME_PINGPONG;
         startSelectedGame(now);
       } else if (b == '2') {
         Serial.println("CMD 2 space");
+        stopLoveStoryMode();
         webFrameActive = false;
         activeScreen = SCREEN_MINIGAME;
         selectedGame = GAME_SPACE;
         startSelectedGame(now);
       } else if (b == 'O') {
         Serial.println("CMD O removed -> face");
+        stopLoveStoryMode();
         webFrameActive = false;
         showFaceScreen();
         activateMood(MOOD_HAPPY, now, 1600);
       } else if (b == 'F') {
         Serial.println("CMD F face");
+        stopLoveStoryMode();
         webFrameActive = false;
         showFaceScreen();
         activateMood(MOOD_HAPPY, now, 1600);
+      } else if (b == 'Y') {
+        Serial.println("CMD Y love story");
+        startLoveStoryMode(now);
       } else if (b == 'P') {
         Serial.println("CMD P tap");
         touch.pendingEvent = TOUCH_TAP;
@@ -1309,6 +1364,18 @@ Mood chooseMood(unsigned long now) {
   return activeMood;
 #endif
 
+  if (loveStoryActive) {
+    unsigned long elapsed = loveStoryElapsed(now);
+    if (elapsed >= LOVE_STORY_DURATION_MS) {
+      stopLoveStoryMode();
+      activateMood(MOOD_PLEASED, now, 3200);
+      return activeMood;
+    }
+    activeMood = loveStoryTimelineMood(elapsed);
+    moodUntilMs = now + 620UL;
+    return activeMood;
+  }
+
 #if LOVE_ME_NOT_MODE
   activeMood = loveMeNotMood(now);
   moodUntilMs = now + 600UL;
@@ -1454,6 +1521,14 @@ FacePose targetPose(unsigned long now) {
 
   float breathe = wave(now, 3600.0f);
   float bob = wave(now + 400UL, 2800.0f);
+  float loveBeat = 0.0f;
+  float loveOffBeat = 0.0f;
+  if (loveStoryActive) {
+    unsigned long songNow = loveStoryElapsed(now);
+    loveBeat = pulse(songNow, 575UL, 0UL, 180UL);
+    loveOffBeat = pulse(songNow, 575UL, 287UL, 135UL);
+    bob += loveBeat * 1.9f - loveOffBeat * 0.45f;
+  }
 #if LOVE_ME_NOT_MODE || LOVE_STORY_MODE
   const uint16_t songBeatMs = LOVE_STORY_MODE ? 575 : 526;
   float beatPulse = pulse(now, songBeatMs, 0UL, 170UL);
@@ -1505,6 +1580,25 @@ FacePose targetPose(unsigned long now) {
     p.hearts = max(p.hearts, cutePulse * 0.55f);
   }
 #endif
+
+  if (loveStoryActive) {
+    unsigned long songNow = loveStoryElapsed(now);
+    float chorusEnergy = (songNow > 52000UL && songNow < 112000UL) ||
+                         (songNow > 156000UL && songNow < 226000UL) ? 1.0f : 0.45f;
+    p.eyeLY += loveBeat * 1.45f;
+    p.eyeRY += loveBeat * 1.45f;
+    p.mouthW += loveBeat * (3.0f + chorusEnergy);
+    p.mouthDepth += loveBeat * 1.5f;
+    p.hearts = max(p.hearts, 0.45f + chorusEnergy * 0.35f + loveBeat * 0.22f);
+    p.sparkle = max(p.sparkle, 0.34f + loveOffBeat * 0.45f);
+    p.blush = max(p.blush, 0.45f + loveBeat * 0.35f);
+    if (songNow > 136000UL && songNow < 156000UL) {
+      p.stress = max(p.stress, 0.35f + loveOffBeat * 0.35f);
+    }
+    if (songNow > 178000UL) {
+      p.proud = max(p.proud, 0.55f);
+    }
+  }
 
 #if LOVE_ME_NOT_MODE || LOVE_STORY_MODE
   p.eyeLY += beatPulse * 1.35f;
@@ -2427,6 +2521,139 @@ void drawLoveStoryCaption(unsigned long now) {
 #else
   (void)now;
 #endif
+}
+
+const char* loveStorySceneCaption(unsigned long elapsed) {
+  if (elapsed < 23000UL) return "first look";
+  if (elapsed < 52000UL) return "balcony";
+  if (elapsed < 92000UL) return "run";
+  if (elapsed < 136000UL) return "garden";
+  if (elapsed < 156000UL) return "waiting";
+  if (elapsed < 178000UL) return "found";
+  if (elapsed < 205000UL) return "ring";
+  if (elapsed < 226000UL) return "yes";
+  return "love story";
+}
+
+void drawSketchHeart(int x, int y) {
+  display.drawPixel(x - 1, y, SSD1306_WHITE);
+  display.drawPixel(x + 1, y, SSD1306_WHITE);
+  display.drawPixel(x - 2, y + 1, SSD1306_WHITE);
+  display.drawPixel(x + 2, y + 1, SSD1306_WHITE);
+  display.drawPixel(x - 1, y + 2, SSD1306_WHITE);
+  display.drawPixel(x + 1, y + 2, SSD1306_WHITE);
+  display.drawPixel(x, y + 3, SSD1306_WHITE);
+}
+
+void drawSketchPerson(int x, int y, int dir, uint8_t pose) {
+  display.drawCircle(x, y - 15, 3, SSD1306_WHITE);
+  display.drawPixel(x + dir * 2, y - 16, SSD1306_WHITE);
+  display.drawLine(x, y - 12, x, y - 4, SSD1306_WHITE);
+
+  if (pose == 0) {
+    display.drawLine(x, y - 9, x + dir * 6, y - 7, SSD1306_WHITE);
+    display.drawLine(x, y - 8, x - dir * 5, y - 5, SSD1306_WHITE);
+    display.drawLine(x, y - 4, x - 3, y + 2, SSD1306_WHITE);
+    display.drawLine(x, y - 4, x + 3, y + 2, SSD1306_WHITE);
+  } else if (pose == 1) {
+    display.drawLine(x, y - 9, x + dir * 8, y - 12, SSD1306_WHITE);
+    display.drawLine(x, y - 8, x - dir * 5, y - 10, SSD1306_WHITE);
+    display.drawLine(x, y - 4, x + dir * 6, y + 1, SSD1306_WHITE);
+    display.drawLine(x, y - 4, x - dir * 4, y + 2, SSD1306_WHITE);
+  } else {
+    display.drawLine(x, y - 9, x + dir * 5, y - 11, SSD1306_WHITE);
+    display.drawLine(x, y - 8, x - dir * 4, y - 10, SSD1306_WHITE);
+    display.drawLine(x, y - 4, x - 4, y + 2, SSD1306_WHITE);
+    display.drawLine(x, y - 4, x + 4, y + 2, SSD1306_WHITE);
+    display.drawLine(x - 5, y + 2, x + 5, y + 2, SSD1306_WHITE);
+  }
+}
+
+void drawSketchStars(unsigned long now, uint8_t amount) {
+  for (uint8_t i = 0; i < amount; i++) {
+    uint8_t x = (uint8_t)((i * 23 + now / 210UL) % 124UL) + 2;
+    uint8_t y = (uint8_t)(6 + ((i * 17 + now / 330UL) % 32UL));
+    display.drawPixel(x, y, SSD1306_WHITE);
+    if (((now / 260UL) + i) % 3 == 0) {
+      display.drawPixel(x + 1, y, SSD1306_WHITE);
+      display.drawPixel(x, y + 1, SSD1306_WHITE);
+    }
+  }
+}
+
+void drawHandLine(int x1, int y1, int x2, int y2) {
+  display.drawLine(x1, y1, x2, y2, SSD1306_WHITE);
+  if (((x1 + y1 + x2 + y2) & 1) == 0) {
+    display.drawPixel((x1 + x2) / 2, (y1 + y2) / 2 - 1, SSD1306_WHITE);
+  }
+}
+
+void drawLoveStoryScene(unsigned long now) {
+  if (!loveStoryActive) return;
+
+  unsigned long elapsed = loveStoryElapsed(now);
+  int bob = (int)(wave(now, 1500.0f) * 1.0f);
+  int sparklePhase = (now / 260UL) % 12UL;
+  uint8_t runStep = (now / 280UL) % 4UL;
+  uint8_t section = 0;
+  if (elapsed >= 23000UL) section = 1;
+  if (elapsed >= 52000UL) section = 2;
+  if (elapsed >= 92000UL) section = 3;
+  if (elapsed >= 136000UL) section = 4;
+  if (elapsed >= 178000UL) section = 5;
+
+  display.clearDisplay();
+  drawSketchStars(now, section == 0 ? 8 : 5);
+
+  if (section <= 1) {
+    drawHandLine(0, 46, 127, 46);
+    for (int x = 4; x < 128; x += 13) {
+      drawHandLine(x, 46, x + 2, 58);
+    }
+    drawHandLine(8, 58, 120, 58);
+    drawSketchPerson(41, 43 + bob, 1, section == 0 ? 0 : 1);
+    drawSketchPerson(86, 43 - bob, -1, section == 0 ? 0 : 1);
+    if (sparklePhase < 6) drawSketchHeart(64, 20 - (sparklePhase / 2));
+  } else if (section == 2) {
+    drawHandLine(0, 58, 127, 58);
+    for (int x = 0; x < 128; x += 18) {
+      display.drawPixel(x + sparklePhase, 53, SSD1306_WHITE);
+      display.drawPixel(x + 5, 55, SSD1306_WHITE);
+    }
+    int shift = (int)((elapsed - 52000UL) / 1400UL) % 20;
+    drawSketchPerson(30 + shift, 50 + bob, 1, runStep % 2);
+    drawSketchPerson(84 + shift / 2, 50 - bob, 1, (runStep + 1) % 2);
+    drawSketchHeart(68, 27 + (sparklePhase % 2));
+  } else if (section == 3 || section == 4) {
+    drawHandLine(0, 59, 42, 52);
+    drawHandLine(86, 52, 127, 59);
+    drawHandLine(43, 52, 86, 52);
+    for (int x = 8; x < 125; x += 20) {
+      display.drawLine(x, 55, x + 3, 51, SSD1306_WHITE);
+      display.drawPixel(x + 5, 50, SSD1306_WHITE);
+    }
+    int gap = section == 4 ? 15 - (sparklePhase / 2) : 34;
+    drawSketchPerson(64 - gap, 49 + bob, 1, section == 4 ? 1 : 0);
+    drawSketchPerson(64 + gap, 49 - bob, -1, section == 4 ? 1 : 0);
+    if (section == 4 && sparklePhase < 8) drawSketchHeart(64, 28 - sparklePhase / 2);
+  } else {
+    drawHandLine(0, 58, 127, 58);
+    drawSketchPerson(43, 49 + bob, 1, 0);
+    drawSketchPerson(83, 51 - bob, -1, 2);
+    display.drawRoundRect(60, 39, 10, 7, 1, SSD1306_WHITE);
+    display.drawCircle(65, 37, 3, SSD1306_WHITE);
+    display.drawPixel(65, 37, SSD1306_BLACK);
+    drawSketchHeart(64, 25 - (sparklePhase % 4));
+    drawSketchHeart(28, 19 + (sparklePhase % 3));
+    drawSketchHeart(101, 18 + ((sparklePhase + 2) % 3));
+  }
+
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextWrap(false);
+  display.setCursor(2, 1);
+  display.print(loveStorySceneCaption(elapsed));
+  display.display();
 }
 
 bool isHotCondition() {
@@ -3508,6 +3735,12 @@ void renderSensorTest(unsigned long now) {
 }
 
 void renderFace(unsigned long now) {
+  if (loveStoryActive) {
+    chooseMood(now);
+    drawLoveStoryScene(now);
+    return;
+  }
+
   blendPose(targetPose(now));
 
   display.clearDisplay();

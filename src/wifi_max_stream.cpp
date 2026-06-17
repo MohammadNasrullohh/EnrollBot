@@ -5,6 +5,8 @@
 #include "game_images.h"
 #include <Wire.h>
 #include <WiFi.h>
+#include <WebSocketsClient.h>
+#include <HTTPClient.h>
 #include <WiFiUdp.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SH110X.h>
@@ -26,6 +28,8 @@
 #define MAX_LRC_PIN D8
 #define MAX_DIN_PIN D7
 #define MIC_SD_PIN D10
+#define DFPLAYER_RX_PIN D6  // XIAO RX receives from DFPlayer TX
+#define DFPLAYER_TX_PIN D1  // XIAO TX sends to DFPlayer RX
 #define DHT_PIN D2
 #define DHT_TYPE DHT22
 #define TOUCH_PIN D3
@@ -35,17 +39,18 @@ const uint16_t TELEMETRY_PORT = 7788;
 const uint32_t AUDIO_RATE = 16000;
 const uint16_t AUDIO_FRAMES = 128;
 const uint16_t AUDIO_BLOCK_BYTES = AUDIO_FRAMES * 2;
-const uint16_t AUDIO_RING_SIZE = 24576;
-const uint16_t AUDIO_PREBUFFER_BYTES = 6144;
-const uint16_t READ_CHUNK = 1024;
+const uint16_t AUDIO_RING_SIZE = 49152;
+const uint16_t AUDIO_PREBUFFER_BYTES = 12288;
+const uint16_t READ_CHUNK = 512;
 
 Adafruit_SH1106G display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 Adafruit_MPU6050 mpu;
 DHT dht(DHT_PIN, DHT_TYPE);
-WiFiServer audioServer(AUDIO_PORT);
-WiFiClient audioClient;
-WiFiUDP telemetryUdp;
-WiFiUDP micUdp;
+HTTPClient audioHttp;
+WiFiClient* audioStream = nullptr;
+WebSocketsClient webSocket;
+HardwareSerial dfSerial(1);
+DFRobotDFPlayerMini dfPlayer;
 
 bool oledReady = false;
 bool mpuReady = false;
@@ -53,8 +58,16 @@ bool rawMpuMode = false;
 uint8_t mpuAddr = 0x68;
 uint8_t mpuWho = 0xFF;
 bool dhtReady = false;
+bool dfReady = false;
+bool dfPlaying = false;
+uint16_t dfTrack = 1;
+uint8_t dfVolume = 22;
 bool playing = false;
 bool wasPlaying = false;
+bool localTonePlaying = false;
+unsigned long localToneUntilMs = 0;
+uint32_t localToneFrame = 0;
+float localToneVolume = 0.28f;
 unsigned long lastAudioMs = 0;
 unsigned long lastDrawMs = 0;
 unsigned long lastMpuMs = 0;
@@ -107,6 +120,8 @@ bool touchDown = false;
 bool lastTouchReading = false;
 unsigned long touchChangedMs = 0;
 unsigned long lastTouchDebounce = 0;
+unsigned long lastPhysicalMotionMs = 0;
+unsigned long touchMutedUntilMs = 0;
 
 // Chat State
 char chatText[256] = "";
@@ -132,6 +147,8 @@ unsigned long laughUntilMs = 0;
 unsigned long glitchUntilMs = 0;
 unsigned long pantUntilMs = 0;
 unsigned long cryUntilMs = 0;
+unsigned long cryStartMs = 0;
+bool mpuRoughEpisode = false;
 unsigned long lastActivityMs = 0;
 bool isSleepingWithBubble = false;
 int manualJoyX = 0;
@@ -145,6 +162,14 @@ uint8_t histIdx = 0;
 unsigned long lastHistMs = 0;
 float sustainedTiltX = 0.0f;
 unsigned long sustainedTiltStartMs = 0;
+float mpuMoodEnergy = 0.0f;
+float mpuMoodCurious = 0.0f;
+float mpuMoodWoozy = 0.0f;
+float mpuMoodAnnoyed = 0.0f;
+float mpuMoodStartle = 0.0f;
+float mpuMoodCalm = 1.0f;
+unsigned long lastMpuMoodShiftMs = 0;
+uint8_t mpuMicroMood = 0;
 // Natural blink system
 unsigned long nextBlinkMs = 0;
 unsigned long blinkStartMs = 0;
@@ -339,7 +364,17 @@ int8_t   morphStep    = 0;
 bool     morphing     = false;
 
 
-enum AppState { STATE_FACE, STATE_MENU, STATE_GAMES, STATE_SENSOR, STATE_REMINDER, STATE_DRAW, STATE_MUSIC, STATE_CHAT };
+enum AppState {
+  STATE_FACE,
+  STATE_MENU,
+  STATE_GAMES,
+  STATE_SENSOR,
+  STATE_REMINDER,
+  STATE_DRAW,
+  STATE_MUSIC,
+  STATE_CHAT,
+  STATE_ASSISTANT
+};
 AppState currentState = STATE_FACE;
 bool req_lovestory = false;
 uint8_t req_song = 0;
@@ -355,6 +390,35 @@ uint16_t ringTail = 0;
 uint16_t ringCount = 0;
 uint8_t readBuffer[READ_CHUNK];
 int16_t stereoSamples[AUDIO_FRAMES * 2];
+
+enum I2SPath : uint8_t {
+  I2S_PATH_NONE,
+  I2S_PATH_AUDIO,
+  I2S_PATH_MIC
+};
+I2SPath activeI2SPath = I2S_PATH_NONE;
+bool i2sInstalled = false;
+unsigned long lastI2SSwitchMs = 0;
+
+enum VoiceAssistantState : uint8_t {
+  VOICE_IDLE,
+  VOICE_LISTENING,
+  VOICE_THINKING,
+  VOICE_SPEAKING,
+  VOICE_ERROR
+};
+
+VoiceAssistantState voiceState = VOICE_IDLE;
+bool voiceRecording = false;
+unsigned long voiceStartedMs = 0;
+unsigned long voiceStateMs = 0;
+uint32_t voiceSamplesSent = 0;
+float voiceLevel = 0.0f;
+uint8_t voicePacket[4 + 1024];
+uint16_t voicePacketBytes = 4;
+bool voicePlaybackSeen = false;
+const unsigned long VOICE_HOLD_MS = 650UL;
+const unsigned long VOICE_MAX_MS = 9000UL;
 
 enum CueMood : uint8_t {
   CUE_IDLE,
@@ -498,32 +562,192 @@ void setupDHT() {
 void initMonsterBattle();
 void playerAttack();
 void enterDrawMode(bool clearCanvas);
+void drawStatus(const char* title, const char* line1, const char* line2);
+void ringReset();
+void setupDFPlayer();
+void updateDFPlayer();
+void stopWifiAudioForDf();
+void dfPlayTrack(uint16_t track);
+void dfStop();
+void dfPause();
+void dfSetVolume(uint8_t volume);
+void processDfPlayerCommand(String payload);
+void setVoiceState(VoiceAssistantState state);
+void beginVoiceCapture();
+void finishVoiceCapture();
+void serviceMicrophone();
+
+void setupDFPlayer() {
+  dfSerial.begin(9600, SERIAL_8N1, DFPLAYER_RX_PIN, DFPLAYER_TX_PIN);
+  delay(800);
+  dfReady = dfPlayer.begin(dfSerial, false, true);
+  if (!dfReady) {
+    Serial.println("DFPlayer ERR: cek VCC 5V, GND, TX->D6, RX->D1, SD /mp3/0001.mp3");
+    if (oledReady) drawStatus("DFPLAYER ERR", "TX>D6 RX>D1", "cek SD 0001.mp3");
+    delay(700);
+    return;
+  }
+
+  dfPlayer.volume(dfVolume);
+  dfPlaying = false;
+  Serial.println("DFPlayer OK on TX D6 / RX D1");
+  if (oledReady) {
+    drawStatus("DFPLAYER OK", "/mp3/0001.mp3", "siap diputar");
+    delay(600);
+  }
+}
+
+void stopWifiAudioForDf() {
+  if (audioStream != nullptr) {
+    audioHttp.end();
+    audioStream = nullptr;
+  }
+  playing = false;
+  ringReset();
+  memset(stereoSamples, 0, sizeof(stereoSamples));
+  size_t written = 0;
+  i2s_write(I2S_NUM_0, stereoSamples, sizeof(stereoSamples), &written, 20 / portTICK_PERIOD_MS);
+}
+
+void dfSetVolume(uint8_t volume) {
+  dfVolume = constrain(volume, 0, 30);
+  if (dfReady) dfPlayer.volume(dfVolume);
+  Serial.print("DF volume=");
+  Serial.println(dfVolume);
+}
+
+void dfPlayTrack(uint16_t track) {
+  if (track < 1) track = 1;
+  dfTrack = track;
+  currentState = STATE_FACE;
+  if (!dfReady) {
+    Serial.println("DFPlayer not ready");
+    if (oledReady) drawStatus("DFPLAYER ERR", "module belum kebaca", "cek wiring/SD");
+    return;
+  }
+
+  stopWifiAudioForDf();
+  dfPlayer.volume(dfVolume);
+  dfPlayer.playMp3Folder(dfTrack);
+  dfPlaying = true;
+  Serial.print("DF play /mp3/");
+  if (dfTrack < 10) Serial.print("000");
+  else if (dfTrack < 100) Serial.print("00");
+  else if (dfTrack < 1000) Serial.print("0");
+  Serial.print(dfTrack);
+  Serial.println(".mp3");
+  if (oledReady) {
+    char line[22];
+    snprintf(line, sizeof(line), "PLAY %04u.mp3", dfTrack);
+    drawStatus("DFPLAYER", line, "speaker DFPlayer");
+  }
+}
+
+void dfStop() {
+  if (dfReady) dfPlayer.stop();
+  dfPlaying = false;
+  currentState = STATE_FACE;
+  Serial.println("DF stop");
+}
+
+void dfPause() {
+  if (dfReady) dfPlayer.pause();
+  dfPlaying = false;
+  Serial.println("DF pause");
+}
+
+void processDfPlayerCommand(String payload) {
+  payload.trim();
+  payload.toUpperCase();
+  if (payload.startsWith("PLAY")) {
+    int colon = payload.indexOf(':');
+    uint16_t track = colon >= 0 ? payload.substring(colon + 1).toInt() : 1;
+    dfPlayTrack(track);
+  } else if (payload.startsWith("STOP")) {
+    dfStop();
+  } else if (payload.startsWith("PAUSE")) {
+    dfPause();
+  } else if (payload.startsWith("VOL")) {
+    int colon = payload.indexOf(':');
+    uint8_t vol = colon >= 0 ? payload.substring(colon + 1).toInt() : dfVolume;
+    dfSetVolume(vol);
+  }
+}
+
+void updateDFPlayer() {
+  if (!dfReady) return;
+  if (!dfPlayer.available()) return;
+  uint8_t type = dfPlayer.readType();
+  int value = dfPlayer.read();
+  Serial.print("DF event type=");
+  Serial.print(type);
+  Serial.print(" value=");
+  Serial.println(value);
+  if (type == DFPlayerPlayFinished) {
+    dfPlaying = false;
+  }
+}
 
 void updateTouch() {
   unsigned long now = millis();
+  webSocket.loop();
   bool reading = digitalRead(TOUCH_PIN) == HIGH;
+  bool audioNoiseWindow =
+      audioStream != nullptr ||
+      playing ||
+      localTonePlaying ||
+      dfPlaying ||
+      now < touchMutedUntilMs;
+
+  // Moving jumper wires and shared 3V3/GND noise can briefly pull a digital
+  // touch module HIGH. Only block a new press; an accepted press can still
+  // release normally.
+  bool motionRecentlyActive =
+      now - lastPhysicalMotionMs < 550UL ||
+      shakeSmooth > 0.14f ||
+      spinSmooth > 0.12f;
+  if (!touchDown && motionRecentlyActive) {
+    reading = false;
+  }
+
+  if (audioNoiseWindow) {
+    reading = false; // Ignore touch during audio to prevent I2S/speaker noise false triggers
+  }
+
   if (reading != lastTouchReading) {
     lastTouchReading = reading;
     touchChangedMs = now;
   }
-  if (now - touchChangedMs < 100UL) return;
-  if (reading == touchDown) return;
-
-  touchDown = reading;
-  if (touchDown) {
-    touchDownMs = now;
-    // Instantly go to menu on touch
-    if (currentState == STATE_FACE) {
-      currentState = STATE_MENU;
-      menuCursor = 0;
+  const unsigned long stableMs = reading ? 320UL : 120UL;
+  if (now - touchChangedMs < stableMs) return;
+  if (reading == touchDown) {
+    if (touchDown && currentState == STATE_FACE && !voiceRecording &&
+        now - touchDownMs >= VOICE_HOLD_MS) {
+      beginVoiceCapture();
+    }
+    if (voiceRecording && now - voiceStartedMs >= VOICE_MAX_MS) {
+      finishVoiceCapture();
+      touchDown = false;
     }
     return;
   }
 
-  unsigned long held = now - touchDownMs;
+  touchDown = reading;
+  if (touchDown) {
+    touchDownMs = now;
+    return;
+  }
 
-  if (currentState == STATE_FACE) {
-    // Already handled in touchDown above
+  unsigned long held = now - touchDownMs;
+  if (held < 70UL) return;
+
+  if (voiceRecording) {
+    finishVoiceCapture();
+  } else if (currentState == STATE_FACE) {
+    if (held < VOICE_HOLD_MS) {
+      currentState = STATE_MENU;
+      menuCursor = 0;
+    }
   } else if (currentState == STATE_MENU) {
     if (held > 600UL) {
       if (menuCursor == 0) currentState = STATE_GAMES;
@@ -551,12 +775,14 @@ void updateTouch() {
       } else if (musicCursor == 2) {
         currentState = STATE_FACE;
         req_song = 3;
+      } else if (musicCursor == 3) {
+        dfPlayTrack(1);
       } else {
         currentState = STATE_MENU;
         menuCursor = 3;
       }
     } else {
-      musicCursor = (musicCursor + 1) % 4;
+      musicCursor = (musicCursor + 1) % 5;
     }
   } else if (currentState == STATE_GAMES) {
     if (held > 600UL) {
@@ -574,7 +800,9 @@ void updateTouch() {
         }
       }
     }
-  } else if (currentState == STATE_SENSOR || currentState == STATE_REMINDER || currentState == STATE_DRAW || currentState == STATE_CHAT) {
+  } else if (currentState == STATE_SENSOR || currentState == STATE_REMINDER ||
+             currentState == STATE_DRAW || currentState == STATE_CHAT ||
+             currentState == STATE_ASSISTANT) {
     if (held > 600UL) {
       currentState = STATE_FACE;
     } else {
@@ -654,16 +882,39 @@ void updateMPU() {
   float targetShake = clampFloat(jerk * 0.10f, 0.0f, 1.0f);
   float gyroMag = fabsf(gx) + fabsf(gy) + fabsf(gz);
   float targetSpin = gyroMag > 1.65f ? clampFloat((gyroMag - 1.65f) * 0.22f, 0.0f, 1.0f) : 0.0f;
+  if (targetShake > 0.04f || targetSpin > 0.04f) {
+    lastPhysicalMotionMs = now;
+  }
 
   tiltX += (targetTiltX - tiltX) * 0.18f;
   tiltY += (targetTiltY - tiltY) * 0.18f;
   shakeSmooth = shakeSmooth * 0.80f + targetShake * 0.20f;
   spinSmooth = spinSmooth * 0.82f + targetSpin * 0.18f;
 
+  float tiltMag = sqrtf(targetTiltX * targetTiltX + targetTiltY * targetTiltY);
+  float movement = clampFloat(targetShake * 0.70f + targetSpin * 0.55f + tiltMag * 0.18f, 0.0f, 1.0f);
+  float stillness = 1.0f - clampFloat(targetShake * 1.5f + targetSpin * 1.3f + max(0.0f, tiltMag - 0.12f) * 0.8f, 0.0f, 1.0f);
+  mpuMoodEnergy += (movement - mpuMoodEnergy) * 0.09f;
+  mpuMoodCurious += (clampFloat((tiltMag - 0.20f) * 1.6f, 0.0f, 1.0f) - mpuMoodCurious) * 0.06f;
+  mpuMoodWoozy += (clampFloat(targetSpin * 1.2f + spinMeter * 0.8f + targetShake * 0.25f, 0.0f, 1.0f) - mpuMoodWoozy) * 0.10f;
+  mpuMoodAnnoyed += (clampFloat(shakeMeter * 0.95f + targetShake * 0.45f - mpuMoodWoozy * 0.25f, 0.0f, 1.0f) - mpuMoodAnnoyed) * 0.045f;
+  mpuMoodStartle += (clampFloat((jerk - 7.0f) * 0.18f, 0.0f, 1.0f) - mpuMoodStartle) * 0.20f;
+  mpuMoodCalm += (stillness - mpuMoodCalm) * 0.035f;
+
+  if (now - lastMpuMoodShiftMs > 850UL) {
+    lastMpuMoodShiftMs = now;
+    if (mpuMoodWoozy > 0.46f) mpuMicroMood = 1;
+    else if (mpuMoodAnnoyed > 0.54f) mpuMicroMood = 2;
+    else if (mpuMoodStartle > 0.36f) mpuMicroMood = 3;
+    else if (mpuMoodCurious > 0.42f) mpuMicroMood = (mpuMicroMood == 4) ? 5 : 4;
+    else if (mpuMoodEnergy > 0.30f) mpuMicroMood = (mpuMicroMood == 6) ? 7 : 6;
+    else if (mpuMoodCalm > 0.78f) mpuMicroMood = (mpuMicroMood == 8) ? 9 : 8;
+  }
+
   if (targetShake > 0.0f) {
-    shakeMeter += targetShake * 0.05f;
+    shakeMeter += targetShake * 0.15f;
   } else {
-    shakeMeter -= 0.04f;  // Fast decay — returns to calm quickly
+    shakeMeter -= 0.015f;  // Slower decay so it registers on Web UI
   }
   shakeMeter = clampFloat(shakeMeter, 0.0f, 1.0f);
 
@@ -677,6 +928,7 @@ void updateMPU() {
   // Continuous rotation should feel like dizziness, not anger.
   if (spinMeter > 0.72f) {
     dizzyUntilMs = now + 2600UL;
+    if (spinMeter > 0.88f) mpuRoughEpisode = true;
   } else if (spinMeter > 0.42f) {
     dizzyUntilMs = now + 1400UL;
   }
@@ -685,14 +937,15 @@ void updateMPU() {
   if (shakeMeter > 0.95f) {
     dizzyUntilMs = now + 3000UL;
     angryUntilMs = now + 3000UL;
+    mpuRoughEpisode = true;
     if (shakeActiveStartMs == 0) shakeActiveStartMs = now;
     // Super angry after 2+ seconds of heavy shaking
     if (now - shakeActiveStartMs > 2000UL) {
       superAngryUntilMs = now + 4000UL;
-      cryUntilMs = now + 6000UL; // Crying after very heavy shaking
     }
   } else if (shakeMeter > 0.80f) {
     angryUntilMs = now + 2000UL;
+    mpuRoughEpisode = true;
     if (shakeActiveStartMs == 0) shakeActiveStartMs = now;
   } else if (shakeMeter > 0.60f) {
     dizzyUntilMs = now + 1500UL;
@@ -711,6 +964,21 @@ void updateMPU() {
 
   angryMode = now < angryUntilMs;
   superAngryMode = now < superAngryUntilMs;
+
+  // Emotional aftermath: once rough movement fully stops, Owi calms from
+  // angry/dizzy into sadness and then a short crying expression.
+  if (mpuRoughEpisode &&
+      shakeMeter < 0.18f &&
+      spinMeter < 0.15f &&
+      now > angryUntilMs &&
+      now > superAngryUntilMs &&
+      now > dizzyUntilMs &&
+      now - lastPhysicalMotionMs > 700UL) {
+    sadUntilMs = now + 2200UL;
+    cryStartMs = sadUntilMs;
+    cryUntilMs = cryStartMs + 3800UL;
+    mpuRoughEpisode = false;
+  }
 
   if (now - lastHistMs > 100UL) {
     pitchHistory[histIdx] = ay;
@@ -762,81 +1030,20 @@ void updateMPU() {
 
 void sendTelemetry() {
   unsigned long now = millis();
-  if (now - lastTelemetryMs < 200UL) return;
+  if (now - lastTelemetryMs < 100) return;
   lastTelemetryMs = now;
-  if (WiFi.status() != WL_CONNECTED) return;
-
-  // Determine current expression name and speech text
-  const char* exprName = "NORMAL";
-  const char* speech = "";
-  if (now < freefallUntilMs) { exprName = "FREEFALL"; speech = "AAAA!"; }
-  else if (now < glitchUntilMs) { exprName = "GLITCH"; speech = "ERR.."; }
-  else if (now < cryUntilMs) { exprName = "MENANGIS"; speech = "HUHU.."; }
-  else if (superAngryMode) { exprName = "SUPER MARAH"; speech = "GRRR!!"; }
-  else if (angryMode) { exprName = "MARAH"; speech = "HEH!"; }
-  else if (now < laughUntilMs) { exprName = "KETAWA"; speech = "HAHA!"; }
-  else if (now < dizzyUntilMs) { exprName = "PUSING"; speech = "PUSING~"; }
-  else if (now < pantUntilMs) { exprName = "KEPANASAN"; speech = "PANAS!"; }
-  else if (now < sadUntilMs) { exprName = "SEDIH"; speech = "HMM.."; }
-  else if (now < surprisedUntilMs) { exprName = "KAGET"; speech = "WAH!"; }
-  else if (now < nodUntilMs) { exprName = "ANGGUK"; speech = "IYA!"; }
-  else if (now < headShakeUntilMs) { exprName = "GELENG"; speech = "NGGAK!"; }
-  else if (now < touchLoveUntilMs) { exprName = "SAYANG"; speech = "<3"; }
-  else if (now < touchHappyUntilMs) { exprName = "SENANG"; speech = "HEH~"; }
-  else if (now < annoyedUntilMs) { exprName = "KESAL"; speech = "ISH.."; }
-  else if (now < touchSleepyUntilMs) { exprName = "NGANTUK"; speech = "zzz"; }
-  else if (now < micShoutUntilMs) { exprName = "TERIAKAN"; speech = "HEI!"; }
-  else if (playing) { exprName = "MUSIK"; speech = "~LA~"; }
-  else if (faceDownMode) { exprName = "SEDIH"; speech = "HMM.."; }
-
-  char telemetryJson[800];
-  snprintf(telemetryJson, sizeof(telemetryJson),
-    "{"
-    "\"mpu\":%d,\"dht\":%d,\"ax\":%.2f,\"ay\":%.2f,\"az\":%.2f,"
-    "\"gx\":%.3f,\"gy\":%.3f,\"gz\":%.3f,\"tiltX\":%.2f,\"tiltY\":%.2f,"
-    "\"shake\":%.2f,\"shakeMeter\":%.2f,\"angry\":%d,\"temp\":%.1f,\"hum\":%.0f,"
-    "\"nod\":%d,\"headShake\":%d,\"surprised\":%d,\"curious\":%d,\"faceUp\":%d,\"faceDown\":%d,\"touch\":%d,"
-    "\"game\":%d,\"scoreP\":%d,\"scoreA\":%d,"
-    "\"laugh\":%d,\"glitch\":%d,\"pant\":%d,\"cry\":%d,\"sleep\":%d,"
-    "\"dizzy\":%d,\"sad\":%d,\"annoyed\":%d,\"love\":%d,"
-    "\"inmp\":%d,\"inmpPeak\":%d,\"micActive\":%d,\"max\":%d,\"req_lovestory\":%d,\"req_song\":%d,"
-    "\"state\":%d,"
-    "\"expr\":\"%s\""
-    "}",
-    (mpuReady || rawMpuMode) ? 1 : 0, dhtReady ? 1 : 0,
-    rawAx, rawAy, rawAz, rawGx, rawGy, rawGz,
-    tiltX, tiltY, shakeSmooth, shakeMeter, angryMode ? 1 : 0,
-    isnan(tempC) ? -99.0f : tempC,
-    isnan(humPct) ? -1.0f : humPct,
-    (now < nodUntilMs) ? 1 : 0,
-    (now < headShakeUntilMs) ? 1 : 0,
-    (now < surprisedUntilMs) ? 1 : 0,
-    (now < curiousUntilMs) ? 1 : 0,
-    0,
-    faceDownMode ? 1 : 0,
-    touchDown ? 1 : 0,
-    (currentState == STATE_GAMES ? (int)gamePhase : 0), scorePlayer, scoreAi,
-    (now < laughUntilMs) ? 1 : 0,
-    (now < glitchUntilMs) ? 1 : 0,
-    (now < pantUntilMs) ? 1 : 0,
-    (now < cryUntilMs) ? 1 : 0,
-    (now < touchSleepyUntilMs) ? 1 : 0,
-    (now < dizzyUntilMs) ? 1 : 0,
-    (now < sadUntilMs) ? 1 : 0,
-    (now < annoyedUntilMs) ? 1 : 0,
-    (now < touchLoveUntilMs) ? 1 : 0,
-    (int)(micSmooth * 100), (int)(micPeak * 100), (now < micActiveUntilMs) ? 1 : 0,
-    playing ? 1 : 0, req_lovestory ? 1 : 0, (int)req_song,
-    (int)currentState,
-    exprName
-  );
-
-  if (req_lovestory) req_lovestory = false;
-  req_song = 0;
-
-  telemetryUdp.beginPacket(IPAddress(255, 255, 255, 255), TELEMETRY_PORT);
-  telemetryUdp.write((const uint8_t*)telemetryJson, strlen(telemetryJson));
-  telemetryUdp.endPacket();
+  bool dizzyActive = now < dizzyUntilMs || spinSmooth > 0.42f || spinMeter > 0.58f;
+  bool woozyActive = !dizzyActive && (now < headShakeUntilMs || shakeSmooth > 0.52f || spinSmooth > 0.24f || spinMeter > 0.30f);
+  char json[900];
+  snprintf(json, sizeof(json), 
+    "{\"tiltX\":%.2f,\"tiltY\":%.2f,\"shakeMeter\":%.2f,\"spinMeter\":%.2f,\"moodEnergy\":%.2f,\"moodCalm\":%.2f,\"moodCurious\":%.2f,\"moodAnnoyed\":%.2f,\"temp\":%.1f,\"hum\":%.0f,\"state\":%d,\"expr\":\"%d\",\"touch\":%d,\"nod\":%d,\"headShake\":%d,\"surprised\":%d,\"curious\":%d,\"angry\":%d,\"dizzy\":%d,\"woozy\":%d,\"laugh\":%d,\"sleep\":%d,\"love\":%d,\"cry\":%d,\"pant\":%d,\"scoreP\":%d,\"scoreA\":%d,\"mpu\":%d,\"inmp\":%d,\"inmpPeak\":%d,\"micActive\":%d,\"df\":%d,\"dfPlaying\":%d,\"dfTrack\":%u,\"dfVol\":%u}", 
+    tiltX, tiltY, shakeMeter, spinMeter, mpuMoodEnergy, mpuMoodCalm, mpuMoodCurious, mpuMoodAnnoyed,
+    tempC, humPct, currentState, idleExpr, 
+    touchDown?1:0, nodDetected?1:0, headShakeDetected?1:0, surprisedMode?1:0, curiousMode?1:0, angryMode?1:0,
+    dizzyActive?1:0, woozyActive?1:0, (now<laughUntilMs)?1:0, isSleepingWithBubble?1:0, (now<touchLoveUntilMs)?1:0,
+    (now>=cryStartMs && now<cryUntilMs)?1:0, (now<pantUntilMs)?1:0, scorePlayer, scoreAi, mpuReady?1:0, (int)(micSmooth*100),
+    (int)(micPeak*100), (now<micActiveUntilMs)?1:0, dfReady?1:0, dfPlaying?1:0, dfTrack, dfVolume);
+  webSocket.sendTXT(json);
 }
 
 void updateDHT() {
@@ -872,6 +1079,11 @@ void updateDHT() {
   Serial.print("C H=");
   Serial.print(h, 0);
   Serial.println("%");
+  Serial.print("WiFi: ");
+  Serial.print(WiFi.status() == WL_CONNECTED ? "OK " : "FAIL ");
+  Serial.println(WiFi.localIP().toString());
+  Serial.print("WS: ");
+  Serial.println(webSocket.isConnected() ? "OK" : "FAIL");
 }
 
 void drawStatus(const char* title, const char* line1, const char* line2 = "") {
@@ -1284,7 +1496,31 @@ enum BitmapMpuFace : uint8_t {
   BMP_FACE_HOT,
   BMP_FACE_COLD,
   BMP_FACE_SING,
-  BMP_FACE_ANGRY
+  BMP_FACE_ANGRY,
+  BMP_FACE_SAD,
+  BMP_FACE_EXCITED,
+  BMP_FACE_SMUG,
+  BMP_FACE_SCARED,
+  BMP_FACE_WOOZY,
+  BMP_FACE_COZY,
+  BMP_FACE_CHEEKY,
+  BMP_FACE_BASHFUL,
+  BMP_FACE_FOCUS,
+  BMP_FACE_BORED,
+  BMP_FACE_NOPE,
+  BMP_FACE_PARTY,
+  BMP_FACE_RELIEVED,
+  BMP_FACE_SUS,
+  BMP_FACE_GIGGLE,
+  BMP_FACE_DETERMINED,
+  BMP_FACE_WOW,
+  BMP_FACE_MELT,
+  BMP_FACE_DELIGHT,
+  BMP_FACE_GUILTY,
+  BMP_FACE_DAYDREAM,
+  BMP_FACE_GRUMPY,
+  BMP_FACE_AMAZED,
+  BMP_FACE_CRYING
 };
 
 struct BitmapLayerSpec {
@@ -1369,24 +1605,24 @@ BitmapFaceSpec faceSpecFor(BitmapMpuFace face) {
       f.mouth = layerSpec(lpk_normal_layer_7, 16, 6, 56, 49, 18, 6);
       break;
     case BMP_FACE_HAPPY:
-      f.left = layerSpec(lpk_normal_layer_9, 26, 37, 27, 12, 27, 37);
-      f.right = layerSpec(lpk_normal_layer_8, 26, 37, 76, 12, 27, 37);
-      f.mouth = layerSpec(lpk_normal_layer_7, 16, 6, 55, 48, 20, 7);
+      f.left = layerSpec(img_sing_eye, 26, 12, 28, 27, 27, 13);
+      f.right = layerSpec(img_sing_eye, 26, 12, 75, 27, 27, 13);
+      f.mouth = layerSpec(lpk_normal_layer_7, 16, 6, 53, 47, 24, 8);
       break;
     case BMP_FACE_LOVE:
-      f.left = layerSpec(lpk_normal_layer_9, 26, 37, 27, 11, 28, 39);
-      f.right = layerSpec(lpk_normal_layer_8, 26, 37, 75, 11, 28, 39);
+      f.left = layerSpec(img_heart_eye, 24, 22, 29, 19, 24, 22);
+      f.right = layerSpec(img_heart_eye, 24, 22, 77, 19, 24, 22);
       f.mouth = layerSpec(lpk_normal_layer_7, 16, 6, 54, 48, 22, 7);
       break;
     case BMP_FACE_SHY:
-      f.left = layerSpec(lpk_normal_layer_9, 26, 37, 30, 16, 24, 33);
-      f.right = layerSpec(lpk_normal_layer_8, 26, 37, 76, 16, 24, 33);
+      f.left = layerSpec(lpk_normal_layer_9, 26, 37, 31, 17, 22, 31);
+      f.right = layerSpec(img_sing_eye, 26, 12, 76, 30, 25, 11);
       f.mouth = layerSpec(lpk_normal_layer_7, 16, 6, 58, 50, 13, 5);
       break;
     case BMP_FACE_LAUGH:
-      f.left = layerSpec(lpk_sleepy_layer_6, 26, 9, 28, 33, 28, 10);
-      f.right = layerSpec(lpk_sleepy_layer_6, 26, 9, 74, 33, 28, 10);
-      f.mouth = layerSpec(lpk_normal_layer_7, 16, 6, 52, 48, 27, 8);
+      f.left = layerSpec(img_sing_eye, 26, 12, 27, 27, 26, 13);
+      f.right = layerSpec(img_sing_eye, 26, 12, 75, 27, 26, 13);
+      f.mouth = layerSpec(img_sing_mouth, 20, 12, 54, 45, 20, 12);
       break;
     case BMP_FACE_PLEADING:
       f.left = layerSpec(lpk_normal_layer_9, 26, 37, 26, 9, 30, 42);
@@ -1394,9 +1630,9 @@ BitmapFaceSpec faceSpecFor(BitmapMpuFace face) {
       f.mouth = layerSpec(lpk_sleepy_layer_9, 16, 5, 58, 51, 13, 4);
       break;
     case BMP_FACE_PROUD:
-      f.left = layerSpec(lpk_normal_layer_9, 26, 37, 27, 15, 27, 32);
-      f.right = layerSpec(lpk_normal_layer_8, 26, 37, 76, 15, 27, 32);
-      f.mouth = layerSpec(lpk_normal_layer_7, 16, 6, 55, 48, 21, 6);
+      f.left = layerSpec(img_sing_eye, 26, 12, 28, 29, 26, 11);
+      f.right = layerSpec(img_sing_eye, 26, 12, 76, 29, 26, 11);
+      f.mouth = layerSpec(img_mouth_smirk, 20, 5, 55, 49, 20, 5);
       break;
     case BMP_FACE_CURIOUS:
       f.left = layerSpec(lpk_question_layer_9_1, 26, 32, 28, 18, 26, 32);
@@ -1414,9 +1650,9 @@ BitmapFaceSpec faceSpecFor(BitmapMpuFace face) {
       f.mouth = layerSpec(img_sing_mouth, 20, 12, 58, 47, 12, 8);
       break;
     case BMP_FACE_DIZZY:
-      f.left = layerSpec(lpk_normal_layer_9, 26, 37, 30, 14, 25, 36);
-      f.right = layerSpec(lpk_normal_layer_8, 26, 37, 74, 14, 25, 36);
-      f.mouth = layerSpec(lpk_question_layer_7, 16, 6, 57, 49, 16, 6);
+      f.left = layerSpec(img_eye_x, 24, 14, 29, 24, 24, 14);
+      f.right = layerSpec(img_eye_x, 24, 14, 77, 24, 24, 14);
+      f.mouth = layerSpec(img_mouth_flat, 20, 4, 55, 50, 20, 4);
       break;
     case BMP_FACE_SLEEPY:
       f.left = layerSpec(lpk_sleepy_layer_6, 26, 9, 28, 41, 26, 9);
@@ -1430,8 +1666,8 @@ BitmapFaceSpec faceSpecFor(BitmapMpuFace face) {
       f.mouth = layerSpec(img_sing_mouth, 20, 12, 56, 46, 16, 10);
       break;
     case BMP_FACE_COLD:
-      f.left = layerSpec(lpk_normal_layer_9, 26, 37, 31, 18, 21, 28);
-      f.right = layerSpec(lpk_normal_layer_8, 26, 37, 78, 18, 21, 28);
+      f.left = layerSpec(img_eye_small, 24, 10, 30, 29, 23, 10);
+      f.right = layerSpec(img_eye_small, 24, 10, 77, 29, 23, 10);
       f.mouth = layerSpec(lpk_sleepy_layer_9, 16, 5, 58, 51, 13, 4);
       break;
     case BMP_FACE_SING:
@@ -1443,6 +1679,114 @@ BitmapFaceSpec faceSpecFor(BitmapMpuFace face) {
       f.left = layerSpec(lpk_scary_eyes, 61, 20, 33, 16, 61, 20);
       f.mouth = layerSpec(lpk_scary_mouth, 59, 15, 38, 44, 51, 11);
       break;
+    case BMP_FACE_SAD:
+      f.left = layerSpec(lpk_normal_layer_9, 26, 37, 30, 17, 23, 31);
+      f.right = layerSpec(lpk_normal_layer_8, 26, 37, 77, 17, 23, 31);
+      f.mouth = layerSpec(img_mouth_frown, 20, 6, 55, 49, 20, 6);
+      break;
+    case BMP_FACE_EXCITED:
+      f.left = layerSpec(img_eye_star, 24, 14, 29, 22, 24, 14);
+      f.right = layerSpec(img_eye_star, 24, 14, 77, 22, 24, 14);
+      f.mouth = layerSpec(lpk_normal_layer_7, 16, 6, 52, 47, 27, 8);
+      break;
+    case BMP_FACE_SMUG:
+      f.left = layerSpec(img_sing_eye, 26, 12, 29, 30, 25, 10);
+      f.right = layerSpec(lpk_normal_layer_8, 26, 37, 78, 17, 22, 30);
+      f.mouth = layerSpec(img_mouth_smirk, 20, 5, 55, 49, 20, 5);
+      break;
+    case BMP_FACE_SCARED:
+      f.left = layerSpec(img_eye_small, 24, 10, 31, 25, 22, 12);
+      f.right = layerSpec(img_eye_small, 24, 10, 78, 25, 22, 12);
+      f.mouth = layerSpec(img_mouth_open_small, 16, 8, 57, 47, 16, 8);
+      break;
+    case BMP_FACE_WOOZY:
+      f.left = layerSpec(img_eye_x, 24, 14, 30, 23, 22, 13);
+      f.right = layerSpec(lpk_normal_layer_8, 26, 37, 78, 17, 22, 30);
+      f.mouth = layerSpec(img_mouth_smirk, 20, 5, 55, 50, 19, 5);
+      break;
+    case BMP_FACE_COZY:
+      f.left = layerSpec(lpk_sleepy_layer_6, 26, 9, 29, 33, 25, 9);
+      f.right = layerSpec(lpk_sleepy_layer_6, 26, 9, 76, 33, 25, 9);
+      f.mouth = layerSpec(lpk_normal_layer_7, 16, 6, 56, 48, 18, 6);
+      break;
+    case BMP_FACE_CHEEKY:
+      f.left = layerSpec(img_sing_eye, 26, 12, 29, 29, 25, 11);
+      f.right = layerSpec(lpk_normal_layer_8, 26, 37, 78, 16, 23, 31);
+      f.mouth = layerSpec(img_mouth_smirk, 20, 5, 55, 48, 22, 5);
+      break;
+    case BMP_FACE_BASHFUL:
+      f.left = layerSpec(lpk_normal_layer_9, 26, 37, 31, 20, 21, 28);
+      f.right = layerSpec(lpk_normal_layer_8, 26, 37, 78, 20, 21, 28);
+      f.mouth = layerSpec(lpk_sleepy_layer_9, 16, 5, 58, 50, 13, 4);
+      break;
+    case BMP_FACE_FOCUS:
+      f.left = layerSpec(lpk_sleepy_layer_6, 26, 9, 28, 29, 27, 10);
+      f.right = layerSpec(lpk_sleepy_layer_6, 26, 9, 75, 29, 27, 10);
+      f.mouth = layerSpec(img_mouth_flat, 20, 4, 55, 50, 20, 4);
+      break;
+    case BMP_FACE_BORED:
+      f.left = layerSpec(lpk_sleepy_layer_6, 26, 9, 28, 36, 26, 9);
+      f.right = layerSpec(lpk_sleepy_layer_6, 26, 9, 77, 36, 26, 9);
+      f.mouth = layerSpec(img_mouth_flat, 20, 4, 55, 51, 17, 4);
+      break;
+    case BMP_FACE_NOPE:
+      f.left = layerSpec(lpk_sleepy_layer_6, 26, 9, 29, 34, 25, 10);
+      f.right = layerSpec(lpk_sleepy_layer_6, 26, 9, 76, 34, 25, 10);
+      f.mouth = layerSpec(img_mouth_frown, 20, 6, 55, 49, 19, 6);
+      break;
+    case BMP_FACE_PARTY:
+      f.left = layerSpec(img_eye_star, 24, 14, 29, 21, 24, 14);
+      f.right = layerSpec(img_heart_eye, 24, 22, 77, 18, 24, 22);
+      f.mouth = layerSpec(lpk_normal_layer_7, 16, 6, 52, 47, 27, 8);
+      break;
+    case BMP_FACE_RELIEVED:
+      f.left = layerSpec(img_sing_eye, 26, 12, 29, 30, 25, 11);
+      f.right = layerSpec(img_sing_eye, 26, 12, 76, 30, 25, 11);
+      f.mouth = layerSpec(lpk_normal_layer_7, 16, 6, 56, 49, 18, 6);
+      break;
+    case BMP_FACE_SUS:
+      f.left = layerSpec(lpk_sleepy_layer_6, 26, 9, 29, 29, 25, 10);
+      f.right = layerSpec(lpk_normal_layer_8, 26, 37, 78, 18, 22, 29);
+      f.mouth = layerSpec(img_mouth_flat, 20, 4, 56, 50, 17, 4);
+      break;
+    case BMP_FACE_GIGGLE:
+      f.left = layerSpec(img_sing_eye, 26, 12, 28, 28, 26, 12);
+      f.right = layerSpec(img_sing_eye, 26, 12, 76, 28, 26, 12);
+      f.mouth = layerSpec(lpk_normal_layer_7, 16, 6, 54, 48, 23, 7);
+      break;
+    case BMP_FACE_DETERMINED:
+      f.left = layerSpec(lpk_sleepy_layer_6, 26, 9, 28, 28, 28, 10);
+      f.right = layerSpec(lpk_sleepy_layer_6, 26, 9, 74, 28, 28, 10);
+      f.mouth = layerSpec(img_mouth_smirk, 20, 5, 55, 50, 20, 5);
+      break;
+    case BMP_FACE_WOW:
+      f.left = layerSpec(lpk_normal_layer_9, 26, 37, 25, 8, 31, 43);
+      f.right = layerSpec(lpk_normal_layer_8, 26, 37, 73, 8, 31, 43);
+      f.mouth = layerSpec(img_mouth_open_small, 16, 8, 57, 47, 16, 9);
+      break;
+    case BMP_FACE_MELT:
+      f.left = layerSpec(lpk_sleepy_layer_6, 26, 9, 29, 38, 25, 10);
+      f.right = layerSpec(lpk_sleepy_layer_6, 26, 9, 76, 38, 25, 10);
+      f.mouth = layerSpec(img_mouth_frown, 20, 6, 56, 50, 17, 5);
+      break;
+    case BMP_FACE_DELIGHT:
+      f.mouth = layerSpec(lpk_normal_layer_7, 16, 6, 52, 46, 27, 9);
+      break;
+    case BMP_FACE_GUILTY:
+      f.mouth = layerSpec(lpk_sleepy_layer_9, 16, 5, 58, 51, 13, 4);
+      break;
+    case BMP_FACE_DAYDREAM:
+      f.mouth = layerSpec(img_mouth_smirk, 20, 5, 55, 49, 20, 5);
+      break;
+    case BMP_FACE_GRUMPY:
+      f.mouth = layerSpec(img_mouth_frown, 20, 6, 54, 49, 22, 6);
+      break;
+    case BMP_FACE_AMAZED:
+      f.mouth = layerSpec(img_mouth_open_small, 16, 8, 57, 47, 16, 9);
+      break;
+    case BMP_FACE_CRYING:
+      f.mouth = layerSpec(img_mouth_frown, 20, 6, 54, 49, 22, 6);
+      break;
     case BMP_FACE_NORMAL:
     default:
       f.left = layerSpec(lpk_normal_layer_9, 26, 37, 28, 13, 26, 37);
@@ -1450,6 +1794,84 @@ BitmapFaceSpec faceSpecFor(BitmapMpuFace face) {
       f.mouth = layerSpec(lpk_normal_layer_7, 16, 6, 57, 48, 16, 6);
       break;
   }
+
+  // Unified Owi eye language: every expression uses the same rounded white
+  // bitmap eye and is differentiated by size, position, pupils, brows and mouth.
+  int eyeW = 26;
+  int eyeH = 37;
+  int eyeY = 13;
+  switch (face) {
+    case BMP_FACE_HAPPY:
+    case BMP_FACE_GIGGLE:
+      eyeW = 27; eyeH = 30; eyeY = 17; break;
+    case BMP_FACE_LOVE:
+    case BMP_FACE_PLEADING:
+      eyeW = 29; eyeH = 40; eyeY = 10; break;
+    case BMP_FACE_SHY:
+    case BMP_FACE_BASHFUL:
+      eyeW = 23; eyeH = 31; eyeY = 17; break;
+    case BMP_FACE_LAUGH:
+    case BMP_FACE_RELIEVED:
+      eyeW = 26; eyeH = 24; eyeY = 22; break;
+    case BMP_FACE_PROUD:
+    case BMP_FACE_SMUG:
+      eyeW = 25; eyeH = 28; eyeY = 19; break;
+    case BMP_FACE_CURIOUS:
+    case BMP_FACE_SUS:
+      eyeW = 26; eyeH = 34; eyeY = 15; break;
+    case BMP_FACE_ANNOYED:
+    case BMP_FACE_BORED:
+    case BMP_FACE_FOCUS:
+    case BMP_FACE_DETERMINED:
+      eyeW = 26; eyeH = 21; eyeY = 24; break;
+    case BMP_FACE_SURPRISED:
+    case BMP_FACE_WOW:
+      eyeW = 30; eyeH = 42; eyeY = 8; break;
+    case BMP_FACE_DIZZY:
+    case BMP_FACE_WOOZY:
+      eyeW = 27; eyeH = 34; eyeY = 15; break;
+    case BMP_FACE_SLEEPY:
+    case BMP_FACE_COZY:
+    case BMP_FACE_MELT:
+      eyeW = 25; eyeH = 18; eyeY = 28; break;
+    case BMP_FACE_HOT:
+      eyeW = 26; eyeH = 23; eyeY = 23; break;
+    case BMP_FACE_COLD:
+    case BMP_FACE_SCARED:
+      eyeW = 23; eyeH = 27; eyeY = 20; break;
+    case BMP_FACE_SING:
+      eyeW = 26; eyeH = 34; eyeY = 15; break;
+    case BMP_FACE_ANGRY:
+    case BMP_FACE_NOPE:
+      eyeW = 27; eyeH = 25; eyeY = 20; break;
+    case BMP_FACE_SAD:
+      eyeW = 24; eyeH = 32; eyeY = 17; break;
+    case BMP_FACE_EXCITED:
+    case BMP_FACE_PARTY:
+    case BMP_FACE_DELIGHT:
+      eyeW = 28; eyeH = 38; eyeY = 12; break;
+    case BMP_FACE_CHEEKY:
+      eyeW = 25; eyeH = 31; eyeY = 17; break;
+    case BMP_FACE_CONTENT:
+      eyeW = 25; eyeH = 32; eyeY = 16; break;
+    case BMP_FACE_GUILTY:
+      eyeW = 24; eyeH = 34; eyeY = 16; break;
+    case BMP_FACE_DAYDREAM:
+      eyeW = 26; eyeH = 33; eyeY = 15; break;
+    case BMP_FACE_GRUMPY:
+      eyeW = 27; eyeH = 24; eyeY = 21; break;
+    case BMP_FACE_AMAZED:
+      eyeW = 31; eyeH = 43; eyeY = 7; break;
+    case BMP_FACE_CRYING:
+      eyeW = 25; eyeH = 34; eyeY = 15; break;
+    case BMP_FACE_NORMAL:
+    default:
+      break;
+  }
+  const int leftX = 41 - eyeW / 2;
+  const int rightX = 89 - eyeW / 2;
+  f.left = layerSpec(lpk_normal_layer_9, 26, 37, leftX, eyeY, eyeW, eyeH);
+  f.right = layerSpec(lpk_normal_layer_8, 26, 37, rightX, eyeY, eyeW, eyeH);
   return f;
 }
 
@@ -1462,22 +1884,20 @@ void drawMorphLayer(const BitmapLayerSpec& from, const BitmapLayerSpec& to, floa
   int ay = a.y + a.h / 2;
   int bx = b.x + b.w / 2;
   int by = b.y + b.h / 2;
-  if (from.enabled && t < 0.82f) {
-    float outT = smoothStep01(clampFloat(t / 0.82f, 0.0f, 1.0f));
-    int cx = lerpBitmapInt(ax, bx, t * 0.78f);
-    int cy = lerpBitmapInt(ay, by, t * 0.78f);
-    int w = lerpBitmapInt(from.w, to.enabled ? to.w : from.w, t);
-    int h = lerpBitmapInt(from.h, to.enabled ? to.h : from.h, t);
-    w = max(1, (int)(w * (1.0f - outT * 0.28f)));
-    h = max(1, (int)(h * (1.0f - outT * 0.22f)));
+  if (from.enabled && t < 0.7f) {
+    float outT = smoothStep01(clampFloat(t / 0.7f, 0.0f, 1.0f));
+    int cx = lerpBitmapInt(ax, bx, t * 0.5f);
+    int cy = lerpBitmapInt(ay, by, t * 0.5f) + (int)(sinf(outT * PI) * 3.0f);
+    int w = max(1, (int)(from.w * (1.0f - outT * 0.8f)));
+    int h = max(1, (int)(from.h * (1.0f + outT * 0.4f)));
     drawBitmapScaled(from.bits, from.srcW, from.srcH, cx - w / 2 + dx, cy - h / 2 + dy, w, h);
   }
-  if (to.enabled && t > 0.18f) {
-    float inT = smoothStep01(clampFloat((t - 0.18f) / 0.82f, 0.0f, 1.0f));
-    int cx = lerpBitmapInt(ax, bx, 0.22f + inT * 0.78f);
-    int cy = lerpBitmapInt(ay, by, 0.22f + inT * 0.78f);
-    int w = lerpBitmapInt(from.enabled ? max(1, from.w / 2) : 1, to.w, inT);
-    int h = lerpBitmapInt(from.enabled ? max(1, from.h / 2) : 1, to.h, inT);
+  if (to.enabled && t > 0.3f) {
+    float inT = smoothStep01(clampFloat((t - 0.3f) / 0.7f, 0.0f, 1.0f));
+    int cx = lerpBitmapInt(ax, bx, 0.5f + inT * 0.5f);
+    int cy = lerpBitmapInt(ay, by, 0.5f + inT * 0.5f) + (int)(sinf((1.0f - inT) * PI) * 3.0f);
+    int w = max(1, (int)(to.w * (0.2f + inT * 0.8f)));
+    int h = max(1, (int)(to.h * (1.4f - inT * 0.4f)));
     drawBitmapScaled(to.bits, to.srcW, to.srcH, cx - w / 2 + dx, cy - h / 2 + dy, w, h);
   }
 }
@@ -1499,6 +1919,29 @@ void drawBitmapLayerDynamic(const BitmapLayerSpec& l, int dx, int dy,
   int x = l.x + dx + ox - addW / 2;
   int y = l.y + dy + oy - addH / 2;
   drawBitmapScaled(l.bits, l.srcW, l.srcH, x, y, w, h);
+}
+
+bool bitmapFaceUsesPupils(BitmapMpuFace face) {
+  (void)face;
+  return true;
+}
+
+void drawBitmapPupil(const BitmapLayerSpec& eye, int dx, int dy,
+                     int eyeOx, int eyeOy, int addW, int addH,
+                     int pupilLookX, int pupilLookY, float blink,
+                     int radiusDelta = 0) {
+  if (!eye.enabled || eye.h + addH < 15 || blink > 0.68f) return;
+  int w = max(1, (int)eye.w + addW);
+  int h = max(1, (int)eye.h + addH);
+  int x = eye.x + dx + eyeOx - addW / 2;
+  int y = eye.y + dy + eyeOy - addH / 2;
+  int radius = constrain(min(w, h) / 7 + radiusDelta, 2, 4);
+  int travelX = max(1, w / 2 - radius - 3);
+  int travelY = max(1, h / 2 - radius - 4);
+  int px = x + w / 2 + constrain(pupilLookX, -travelX, travelX);
+  int py = y + h / 2 + constrain(pupilLookY, -travelY, travelY);
+  display.fillCircle(px, py, radius, OLED_BLACK);
+  if (radius >= 3) display.drawPixel(px - 1, py - 1, OLED_WHITE);
 }
 
 void drawMiniHeart(int x, int y) {
@@ -1552,18 +1995,16 @@ void drawBitmapFaceStable(BitmapMpuFace face, unsigned long now, bool active,
   dy += baseBob;
   dy -= (int)(reactionPulse * 2.2f);
 
-  leftEyeExtraX += (int)(sinf(t * 2.7f + 0.3f) * alive * 0.65f);
-  rightEyeExtraX += (int)(sinf(t * 2.4f + 1.8f) * alive * 0.65f);
-  leftEyeExtraY += (int)(cosf(t * 2.0f + 0.4f) * alive * 0.42f);
-  rightEyeExtraY += (int)(cosf(t * 2.25f + 1.1f) * alive * 0.42f);
-  mouthExtraY += (int)(sinf(t * 1.9f + 2.0f) * alive * 0.30f);
+  // Keep both eyes mechanically aligned. Expression-specific branches may
+  // still offset one eye intentionally, but normal idle motion stays shared.
+  eyeExtraX += (int)(sinf(t * 1.35f + 0.3f) * alive * 0.28f);
+  eyeExtraY += (int)(cosf(t * 1.15f + 0.4f) * alive * 0.22f);
+  mouthExtraY += (int)(sinf(t * 1.25f + 2.0f) * alive * 0.20f);
 
   if (actionKind == 1) {
     dy -= (int)(actionPulse * 3.0f);
     eyeAddH += (int)(actionPulse * 2.0f);
     mouthAddW += (int)(actionPulse * 4.0f);
-    drawSoftSparkle(18, 19 - (int)(actionPulse * 5.0f), 1);
-    drawSoftSparkle(111, 17 - (int)(actionPulse * 4.0f), 1);
   } else if (actionKind == 2) {
     int peek = (int)(sinf(actionPulse * 3.1415926f) * 4.0f);
     eyeExtraX += peek;
@@ -1573,9 +2014,10 @@ void drawBitmapFaceStable(BitmapMpuFace face, unsigned long now, bool active,
     leftEyeAddW += (int)(actionPulse * 2.0f);
     rightEyeAddH -= (int)(actionPulse * 2.0f);
   } else if (actionKind == 4) {
-    int rise = (int)(actionPulse * 8.0f);
-    drawMiniHeart(20, 48 - rise);
-    drawMiniHeart(110, 47 - rise / 2);
+    dx += (int)(sinf(actionPulse * 3.1415926f) * 3.0f);
+    dy -= (int)(actionPulse * 2.0f);
+    leftEyeExtraY -= (int)(actionPulse * 2.0f);
+    rightEyeExtraY += (int)(actionPulse * 1.0f);
   }
 
   if (face == BMP_FACE_NORMAL) {
@@ -1601,19 +2043,13 @@ void drawBitmapFaceStable(BitmapMpuFace face, unsigned long now, bool active,
     mouthExtraY = (int)(sinf(t * 4.4f) * 1.0f);
     leftEyeExtraY -= (int)(fabsf(sinf(t * 5.0f)) * 1.2f);
     rightEyeExtraY -= (int)(fabsf(sinf(t * 5.0f + 0.7f)) * 1.2f);
-    int heartRise = (int)((now / 90UL) % 12UL);
-    drawMiniHeart(19, 48 - heartRise / 2);
-    drawMiniHeart(111, 47 - (heartRise + 5) / 2);
   } else if (face == BMP_FACE_LOVE) {
     float glow = fabsf(sinf(t * 2.8f));
     dy -= (int)(glow * 1.4f);
     eyeAddW = 1 + (int)(glow * 2.0f);
     eyeAddH = 1 + (int)(glow * 2.0f);
     mouthAddW = 2 + (int)(glow * 3.0f);
-    int rise = (int)((now / 80UL) % 18UL);
-    drawMiniHeart(17, 49 - rise / 2);
-    drawMiniHeart(112, 46 - ((rise + 8) % 18) / 2);
-    drawMiniHeart(64 + (int)(sinf(t * 2.0f) * 6.0f), 12 + (int)(cosf(t * 1.8f) * 3.0f));
+    mouthExtraY += (int)(sinf(t * 2.1f) * 1.0f);
   } else if (face == BMP_FACE_SHY) {
     lookX -= 1;
     lookY += 1;
@@ -1624,13 +2060,21 @@ void drawBitmapFaceStable(BitmapMpuFace face, unsigned long now, bool active,
       display.drawLine(103 + i * 4, 45 + i % 2, 106 + i * 4, 46 + i % 2, OLED_WHITE);
     }
   } else if (face == BMP_FACE_LAUGH) {
-    int laughBounce = (int)(-fabsf(sinf(t * 6.0f)) * 3.0f);
+    float laughPhase = fabsf(sinf(t * 8.0f));
+    int laughBounce = (int)(-laughPhase * 3.0f);
     dy += laughBounce;
-    mouthAddW = 3 + (int)(fabsf(sinf(t * 6.0f)) * 4.0f);
-    mouthAddH = 1;
-    mouthExtraY = (int)(sinf(t * 6.0f + 0.5f) * 1.0f);
+    dx += (int)(sinf(t * 12.0f) * 1.5f);
+    mouthAddW = (int)(laughPhase * 4.0f);
+    mouthAddH = (int)(laughPhase * 5.0f);
+    mouthExtraY = (int)(laughPhase * 1.0f);
+    leftEyeExtraY -= (int)(laughPhase * 1.5f);
+    rightEyeExtraY -= (int)(laughPhase * 1.5f);
     drawSoftSparkle(18, 18 + (int)(soft * 2.0f), 1);
     drawSoftSparkle(112, 18 - (int)(soft * 2.0f), 1);
+    if (laughPhase > 0.6f) {
+      display.drawPixel(22, 38, OLED_WHITE);
+      display.drawPixel(106, 38, OLED_WHITE);
+    }
   } else if (face == BMP_FACE_PLEADING) {
     lookY -= 1;
     eyeAddW = 1 + (int)(fabsf(sinf(t * 2.4f)) * 2.0f);
@@ -1677,6 +2121,198 @@ void drawBitmapFaceStable(BitmapMpuFace face, unsigned long now, bool active,
     int browLift = (int)(sinf(t * 2.2f) * 1.0f);
     display.drawLine(29, 29 + browLift, 54, 27 + browLift, OLED_WHITE);
     display.drawLine(76, 27 - browLift, 101, 29 - browLift, OLED_WHITE);
+  } else if (face == BMP_FACE_SAD) {
+    lookY += 1;
+    eyeExtraY += (int)(fabsf(sinf(t * 1.5f)) * 1.0f);
+    mouthExtraY += (int)(sinf(t * 1.7f) * 1.0f);
+    display.drawLine(29, 14, 51, 18, OLED_WHITE);
+    display.drawLine(78, 18, 100, 14, OLED_WHITE);
+    if (actionPulse > 0.45f) {
+      display.drawBitmap(25, 42 + (int)(actionPulse * 5.0f), img_tear, 6, 10, OLED_WHITE);
+    }
+  } else if (face == BMP_FACE_EXCITED) {
+    float jump = fabsf(sinf(t * 4.4f));
+    dy -= (int)(jump * 3.0f);
+    eyeAddW += (int)(jump * 2.0f);
+    eyeAddH += (int)(jump * 2.0f);
+    mouthAddW += 2 + (int)(jump * 3.0f);
+  } else if (face == BMP_FACE_SMUG) {
+    lookX += 2;
+    dx += (int)(sinf(t * 1.4f) * 1.0f);
+    mouthExtraX += 2;
+    rightEyeAddH += (int)(fabsf(sinf(t * 1.8f)) * 1.0f);
+  } else if (face == BMP_FACE_SCARED) {
+    float tremble = sinf(t * 13.0f);
+    dx += (int)(tremble * 1.0f);
+    dy -= 1 + (int)(fabsf(sinf(t * 5.0f)) * 2.0f);
+    eyeAddW += (int)(fabsf(tremble) * 2.0f);
+    mouthAddH += (int)(fabsf(sinf(t * 5.5f)) * 2.0f);
+    display.drawBitmap(104, 13 + (int)(fabsf(tremble) * 2.0f), img_sweat, 4, 8, OLED_WHITE);
+  } else if (face == BMP_FACE_WOOZY) {
+    float roll = t * (4.8f + spinSmooth * 7.0f + shakeSmooth * 4.0f);
+    int sway = (int)(sinf(roll * 0.65f) * 3.0f);
+    dx += sway;
+    dy += (int)(cosf(roll * 0.52f) * 2.0f);
+    leftEyeExtraX += (int)(sinf(roll) * 4.0f);
+    leftEyeExtraY += (int)(cosf(roll) * 2.0f);
+    rightEyeExtraX += (int)(cosf(roll * 0.9f) * 3.0f);
+    rightEyeExtraY += (int)(sinf(roll * 0.8f) * 2.0f);
+    mouthExtraX += (int)(sinf(roll * 0.7f + 1.4f) * 3.0f);
+    mouthExtraY += (int)(cosf(roll * 0.6f) * 1.4f);
+    rightEyeAddH += (int)(sinf(roll * 0.8f) * 2.0f);
+    for (int i = 0; i < 3; i++) {
+      float a = roll + i * 2.09f;
+      int px = 18 + (int)(cosf(a) * (5 + i * 2));
+      int py = 12 + (int)(sinf(a) * (3 + i));
+      display.drawCircle(px, py, 1, OLED_WHITE);
+    }
+    display.drawPixel(110 + (int)(sinf(roll) * 4.0f), 10 + (int)(cosf(roll) * 3.0f), OLED_WHITE);
+  } else if (face == BMP_FACE_COZY) {
+    float inhale = (sinf(t * 1.35f) + 1.0f) * 0.5f;
+    dy += (int)(inhale * 1.8f);
+    eyeAddW += (int)(inhale * 1.0f);
+    mouthAddW += 1 + (int)(inhale * 2.0f);
+    mouthExtraY += (int)(sinf(t * 1.2f + 0.8f) * 0.9f);
+    if (((now / 700UL) % 5UL) == 2UL) {
+      drawSoftSparkle(106, 15 + (int)(sinf(t * 2.0f) * 2.0f), 1);
+    }
+  } else if (face == BMP_FACE_CHEEKY) {
+    float tease = sinf(t * 2.8f);
+    lookX += 2 + (int)(tease * 1.2f);
+    dx += (int)(tease * 1.0f);
+    mouthExtraX += 3;
+    mouthAddW += 1 + (int)(fabsf(tease) * 2.0f);
+    rightEyeAddH += (int)(fabsf(sinf(t * 3.1f)) * 2.0f);
+    if (((now / 620UL) % 4UL) == 1UL) drawMiniHeart(104, 17 + (int)(tease * 2.0f));
+  } else if (face == BMP_FACE_BASHFUL) {
+    lookX -= 2;
+    lookY += 1;
+    dx += (int)(sinf(t * 1.5f) * 1.0f);
+    dy += (int)(fabsf(sinf(t * 1.2f)) * 1.0f);
+    mouthExtraY += 1;
+    for (int i = 0; i < 4; i++) {
+      display.drawLine(18 + i * 3, 46 + (i & 1), 20 + i * 3, 45 + (i & 1), OLED_WHITE);
+      display.drawLine(103 + i * 3, 45 + (i & 1), 105 + i * 3, 46 + (i & 1), OLED_WHITE);
+    }
+  } else if (face == BMP_FACE_FOCUS) {
+    float lock = fabsf(sinf(t * 1.9f));
+    eyeAddW += (int)(lock * 1.0f);
+    mouthAddW += (int)(lock * 1.0f);
+    lookX += (int)(sinf(t * 0.9f) * 0.6f);
+    display.drawLine(26, 26, 55, 24, OLED_WHITE);
+    display.drawLine(75, 24, 104, 26, OLED_WHITE);
+    if (((now / 900UL) % 3UL) == 0) drawSoftSparkle(112, 13, 1);
+  } else if (face == BMP_FACE_BORED) {
+    float droop = (sinf(t * 1.0f) + 1.0f) * 0.5f;
+    dy += 1 + (int)(droop * 1.0f);
+    lookY += 1;
+    mouthExtraX += (int)(sinf(t * 0.9f) * 1.0f);
+    mouthAddW -= 2;
+    if (((now / 1400UL) % 4UL) == 2UL) {
+      display.drawPixel(109, 18, OLED_WHITE);
+      display.drawPixel(113, 16, OLED_WHITE);
+      display.drawPixel(116, 14, OLED_WHITE);
+    }
+  } else if (face == BMP_FACE_NOPE) {
+    float no = sinf(t * 5.5f);
+    dx += (int)(no * 2.2f);
+    eyeExtraX += (int)(-no * 1.0f);
+    mouthExtraX += (int)(no * 1.3f);
+    display.drawLine(22, 16, 33, 7, OLED_WHITE);
+    display.drawLine(33, 7, 44, 16, OLED_WHITE);
+  } else if (face == BMP_FACE_PARTY) {
+    float beat = fabsf(sinf(t * 5.3f));
+    dy -= (int)(beat * 3.0f);
+    dx += (int)(sinf(t * 3.4f) * 2.0f);
+    eyeAddW += (int)(beat * 2.0f);
+    eyeAddH += (int)(beat * 2.0f);
+    mouthAddW += 3 + (int)(beat * 4.0f);
+    drawSoftSparkle(18 + (int)(sinf(t * 3.1f) * 4.0f), 13, 2);
+    drawMiniHeart(108 + (int)(cosf(t * 2.7f) * 3.0f), 15 + (int)(sinf(t * 2.7f) * 2.0f));
+  } else if (face == BMP_FACE_RELIEVED) {
+    float exhale = (sinf(t * 1.15f) + 1.0f) * 0.5f;
+    dy += (int)(exhale * 1.4f);
+    mouthAddW += 1 + (int)(exhale * 2.0f);
+    eyeExtraY += (int)(exhale * 0.8f);
+    if (((now / 1100UL) % 3UL) == 1UL) {
+      display.drawPixel(107, 18, OLED_WHITE);
+      display.drawPixel(111, 16, OLED_WHITE);
+    }
+  } else if (face == BMP_FACE_SUS) {
+    float inspect = sinf(t * 1.55f);
+    lookX += 2 + (int)(inspect * 2.0f);
+    leftEyeAddW -= 1;
+    rightEyeAddH += (int)(fabsf(inspect) * 1.5f);
+    mouthExtraX += (int)(inspect * 1.2f);
+    display.drawLine(28, 24, 54, 22 + (int)(inspect * 1.0f), OLED_WHITE);
+    if (((now / 780UL) % 4UL) == 2UL) drawBitmapScaled(lpk_question_layer_4, 6, 10, 107, 6, 5, 8);
+  } else if (face == BMP_FACE_GIGGLE) {
+    float gig = fabsf(sinf(t * 7.0f));
+    dy -= (int)(gig * 2.0f);
+    dx += (int)(sinf(t * 7.0f) * 1.0f);
+    mouthAddW += 2 + (int)(gig * 3.0f);
+    leftEyeExtraY -= (int)(gig * 1.0f);
+    rightEyeExtraY -= (int)(gig * 1.0f);
+    drawSoftSparkle(18, 20 + (int)(sinf(t * 4.0f) * 2.0f), 1);
+  } else if (face == BMP_FACE_DETERMINED) {
+    float push = fabsf(sinf(t * 2.4f));
+    dy -= (int)(push * 1.2f);
+    eyeAddW += 1;
+    eyeAddH -= 1;
+    mouthExtraX += (int)(sinf(t * 1.8f) * 1.0f);
+    display.drawLine(26, 24, 56, 21, OLED_WHITE);
+    display.drawLine(74, 21, 104, 24, OLED_WHITE);
+  } else if (face == BMP_FACE_WOW) {
+    float wow = fabsf(sinf(t * 4.4f));
+    dy -= (int)(wow * 2.0f);
+    eyeAddW += 1 + (int)(wow * 2.0f);
+    eyeAddH += 1 + (int)(wow * 2.0f);
+    mouthAddW += (int)(wow * 2.0f);
+    mouthAddH += (int)(wow * 3.0f);
+    drawSoftSparkle(17, 15 + (int)(wow * 3.0f), 2);
+    drawSoftSparkle(112, 14 - (int)(wow * 2.0f), 2);
+  } else if (face == BMP_FACE_MELT) {
+    float sink = (sinf(t * 1.3f) + 1.0f) * 0.5f;
+    dy += 2 + (int)(sink * 2.0f);
+    lookY += 2;
+    eyeAddW -= 1;
+    mouthExtraY += (int)(sink * 1.0f);
+    if (((now / 500UL) % 3UL) == 1UL) display.drawBitmap(104, 18, img_sweat, 4, 8, OLED_WHITE);
+  } else if (face == BMP_FACE_DELIGHT) {
+    float lift = fabsf(sinf(t * 3.6f));
+    dy -= (int)(lift * 2.0f);
+    eyeAddW += (int)(lift * 2.0f);
+    eyeAddH += (int)(lift * 1.0f);
+    mouthAddW += 2 + (int)(lift * 3.0f);
+    lookY -= 1;
+    if (((now / 700UL) % 3UL) == 1UL) drawSoftSparkle(111, 14, 2);
+  } else if (face == BMP_FACE_GUILTY) {
+    lookX -= 3;
+    lookY += 3;
+    dy += 1;
+    mouthExtraX -= 1;
+    display.drawLine(29, 17, 51, 20, OLED_WHITE);
+    display.drawLine(78, 20, 100, 17, OLED_WHITE);
+  } else if (face == BMP_FACE_DAYDREAM) {
+    lookX += (int)(sinf(t * 0.8f) * 2.0f);
+    lookY -= 3;
+    dy += (int)(sinf(t * 1.0f) * 1.0f);
+    mouthExtraX += 2;
+    if (((now / 900UL) % 4UL) == 2UL) drawMiniHeart(108, 13 + (int)(sinf(t) * 2.0f));
+  } else if (face == BMP_FACE_GRUMPY) {
+    lookY += 1;
+    mouthExtraX += (int)(sinf(t * 1.5f) * 1.0f);
+    display.drawLine(27, 19, 54, 23, OLED_WHITE);
+    display.drawLine(76, 23, 103, 19, OLED_WHITE);
+  } else if (face == BMP_FACE_AMAZED) {
+    float pop = fabsf(sinf(t * 3.8f));
+    dy -= (int)(pop * 2.0f);
+    eyeAddW += (int)(pop * 2.0f);
+    eyeAddH += (int)(pop * 2.0f);
+    mouthAddH += (int)(pop * 3.0f);
+    lookY -= 1;
+    drawSoftSparkle(17, 15, 2);
+    drawSoftSparkle(112, 13, 1);
   } else if (face == BMP_FACE_SURPRISED) {
     float pop = fabsf(sinf(t * 5.2f));
     eyeAddW = 1 + (int)(pop * 3.0f);
@@ -1747,24 +2383,28 @@ void drawBitmapFaceStable(BitmapMpuFace face, unsigned long now, bool active,
     display.drawCircle(109, nY + 11, 2, OLED_WHITE);
     display.drawFastVLine(112, nY + 3, 8, OLED_WHITE);
   } else if (face == BMP_FACE_ANGRY) {
-    float charge = fabsf(sinf(t * 3.5f));
-    float recoil = powf(fabsf(sinf(t * 2.2f)), 5.0f);
-    dx += (int)(sinf(t * 4.4f) * (0.8f + charge * 0.9f));
-    dy -= (int)(charge * 1.4f + recoil * 2.0f);
-    mouthAddW += (int)(charge * 3.0f);
-    mouthExtraY += (int)(recoil * 1.4f);
-    eyeAddW += (int)(charge * 2.0f);
-    eyeAddH -= 1;
-    leftEyeExtraX += (int)(recoil * -2.0f);
-    rightEyeExtraX += (int)(recoil * 2.0f);
-    display.drawBitmap(13 + (int)(sinf(t * 8.0f) * 1.0f), 8 + (int)(cosf(t * 5.0f) * 1.0f),
-                       img_angry_vein, 8, 8, OLED_WHITE);
-    display.drawLine(104, 11, 121, 8 + (int)(sinf(t * 4.0f) * 2.0f), OLED_WHITE);
-    display.drawLine(106, 16, 122, 15 + (int)(cosf(t * 3.6f) * 2.0f), OLED_WHITE);
-    if (((now / 180UL) % 2UL) == 0) {
-      display.drawLine(24, 7, 18, 4, OLED_WHITE);
-      display.drawLine(116, 29, 123, 27, OLED_WHITE);
+    float charge = (sinf(t * 2.1f) + 1.0f) * 0.5f;
+    dy -= (int)(charge * 1.0f);
+    eyeAddW += 1;
+    eyeAddH -= 2;
+    lookY += 1;
+    mouthAddW += (int)(charge * 2.0f);
+    mouthExtraY += 1;
+    display.drawLine(25, 15, 54, 23, OLED_WHITE);
+    display.drawLine(76, 23, 105, 15, OLED_WHITE);
+    display.drawLine(26, 16, 54, 24, OLED_WHITE);
+    display.drawLine(76, 24, 104, 16, OLED_WHITE);
+    if (superAngryMode) {
+      display.drawBitmap(14, 7, img_angry_vein, 8, 8, OLED_WHITE);
+      display.drawLine(108, 10, 121, 7, OLED_WHITE);
+      display.drawLine(108, 15, 122, 15, OLED_WHITE);
     }
+  } else if (face == BMP_FACE_CRYING) {
+    lookY += 2;
+    dy += (int)(fabsf(sinf(t * 1.8f)) * 1.0f);
+    mouthExtraY += (int)(sinf(t * 2.2f) * 1.0f);
+    display.drawLine(29, 15, 51, 19, OLED_WHITE);
+    display.drawLine(78, 19, 100, 15, OLED_WHITE);
   }
 
   bool blinkable = face != BMP_FACE_DIZZY && face != BMP_FACE_ANGRY &&
@@ -1772,11 +2412,41 @@ void drawBitmapFaceStable(BitmapMpuFace face, unsigned long now, bool active,
                    face != BMP_FACE_LAUGH;
   int leftBlinkH = blinkable && f.left.h > 12 ? -(int)((float)(f.left.h - 5) * blinkL) : 0;
   int rightBlinkH = blinkable && f.right.h > 12 ? -(int)((float)(f.right.h - 5) * blinkR) : 0;
+  bool usePupils = bitmapFaceUsesPupils(face);
+  int eyeBodyLookX = usePupils ? lookX / 4 : lookX;
+  int eyeBodyLookY = usePupils ? lookY / 4 : lookY;
+  int pupilLookX = constrain(lookX, -6, 6);
+  int pupilLookY = constrain(lookY, -5, 5);
+  int leftPupilBiasX = face == BMP_FACE_ANGRY ? 2 : 0;
+  int rightPupilBiasX = face == BMP_FACE_ANGRY ? -2 : 0;
+  int pupilRadiusDelta = face == BMP_FACE_ANGRY ? -1 : 0;
 
-  drawBitmapLayerDynamic(f.left, dx, dy, lookX + eyeExtraX + leftEyeExtraX, lookY + eyeExtraY + leftEyeExtraY,
-                         eyeAddW + leftEyeAddW, eyeAddH + leftEyeAddH + leftBlinkH);
-  drawBitmapLayerDynamic(f.right, dx, dy, lookX + eyeExtraX + rightEyeExtraX, lookY + eyeExtraY + rightEyeExtraY,
-                         eyeAddW + rightEyeAddW, eyeAddH + rightEyeAddH + rightBlinkH);
+  int leftOx = eyeBodyLookX + eyeExtraX + leftEyeExtraX;
+  int leftOy = eyeBodyLookY + eyeExtraY + leftEyeExtraY;
+  int rightOx = eyeBodyLookX + eyeExtraX + rightEyeExtraX;
+  int rightOy = eyeBodyLookY + eyeExtraY + rightEyeExtraY;
+  int leftW = eyeAddW + leftEyeAddW;
+  int leftH = eyeAddH + leftEyeAddH + leftBlinkH;
+  int rightW = eyeAddW + rightEyeAddW;
+  int rightH = eyeAddH + rightEyeAddH + rightBlinkH;
+
+  drawBitmapLayerDynamic(f.left, dx, dy, leftOx, leftOy,
+                         leftW, leftH);
+  drawBitmapLayerDynamic(f.right, dx, dy, rightOx, rightOy,
+                         rightW, rightH);
+  if (usePupils) {
+    drawBitmapPupil(f.left, dx, dy, leftOx, leftOy, leftW, leftH,
+                    pupilLookX + leftPupilBiasX, pupilLookY, blinkL, pupilRadiusDelta);
+    drawBitmapPupil(f.right, dx, dy, rightOx, rightOy, rightW, rightH,
+                    pupilLookX + rightPupilBiasX, pupilLookY, blinkR, pupilRadiusDelta);
+  }
+  if (face == BMP_FACE_CRYING) {
+    int tearWave = (int)((now / 120UL) % 8UL);
+    display.drawLine(37 + dx, 42 + dy, 36 + dx, 51 + dy + tearWave / 3, OLED_WHITE);
+    display.drawLine(93 + dx, 42 + dy, 94 + dx, 51 + dy + tearWave / 3, OLED_WHITE);
+    display.fillCircle(36 + dx, 53 + dy + tearWave / 3, 2, OLED_WHITE);
+    display.fillCircle(94 + dx, 53 + dy + tearWave / 3, 2, OLED_WHITE);
+  }
   drawBitmapLayerDynamic(f.mouth, dx, dy, mouthExtraX, mouthExtraY,
                          mouthAddW, mouthAddH);
   drawBitmapLayerDynamic(f.extra, dx, dy, 0, extraExtraY, 0, 0);
@@ -1789,14 +2459,20 @@ void drawMochi(bool active) {
   static float bitmapSmoothLookY = 0.0f;
   static float bitmapTargetLookX = 0.0f;
   static float bitmapTargetLookY = 0.0f;
+  static float bitmapSmoothBodyX = 0.0f;
+  static float bitmapSmoothBodyY = 0.0f;
   static unsigned long nextNormalGlanceMs = 0;
   static BitmapMpuFace bitmapShownFace = BMP_FACE_NORMAL;
   static BitmapMpuFace bitmapPreviousFace = BMP_FACE_NORMAL;
+  static BitmapMpuFace bitmapCandidateFace = BMP_FACE_NORMAL;
+  static unsigned long bitmapCandidateSinceMs = 0;
   static unsigned long bitmapMorphStartMs = 0;
   static BitmapMpuFace bitmapIdleFace = BMP_FACE_NORMAL;
   static unsigned long nextCuteIdleMs = 0;
+  static uint8_t bitmapIdleStoryIndex = 0;
   static unsigned long bitmapBlinkStartMs = 0;
   static unsigned long nextBitmapBlinkMs = 900;
+  static bool bitmapDoubleBlinkPending = false;
   static unsigned long bitmapWinkStartMs = 0;
   static unsigned long nextBitmapWinkMs = 6500;
   static bool bitmapWinkLeft = false;
@@ -1806,25 +2482,37 @@ void drawMochi(bool active) {
 
   bool bitmapMpuReady = mpuReady || rawMpuMode;
   bool bitmapCalm = !active && (!bitmapMpuReady || (shakeSmooth < 0.18f && spinSmooth < 0.12f && fabsf(tiltX) < 0.28f && fabsf(tiltY) < 0.32f));
+  bool manualMoodActive = manualMood >= 0 && now - manualMoodMs < 6000UL;
   if (!active && now >= nextCuteIdleMs) {
-    switch (random(0, 8)) {
-      case 0: bitmapIdleFace = BMP_FACE_NORMAL; break;
-      case 1: bitmapIdleFace = BMP_FACE_CONTENT; break;
-      case 2: bitmapIdleFace = BMP_FACE_HAPPY; break;
-      case 3: bitmapIdleFace = BMP_FACE_SHY; break;
-      case 4: bitmapIdleFace = BMP_FACE_PROUD; break;
-      case 5: bitmapIdleFace = BMP_FACE_PLEADING; break;
-      case 6: bitmapIdleFace = BMP_FACE_LOVE; break;
-      default: bitmapIdleFace = BMP_FACE_CONTENT; break;
-    }
-    nextCuteIdleMs = now + random(4200, 9000);
+    static const BitmapMpuFace idleStory[] = {
+      BMP_FACE_NORMAL, BMP_FACE_CONTENT, BMP_FACE_COZY,
+      BMP_FACE_CURIOUS, BMP_FACE_CHEEKY, BMP_FACE_HAPPY,
+      BMP_FACE_SHY, BMP_FACE_SMUG, BMP_FACE_PROUD,
+      BMP_FACE_PLEADING, BMP_FACE_BASHFUL, BMP_FACE_EXCITED,
+      BMP_FACE_GIGGLE, BMP_FACE_CONTENT, BMP_FACE_LOVE,
+      BMP_FACE_RELIEVED, BMP_FACE_BORED, BMP_FACE_SUS,
+      BMP_FACE_NORMAL, BMP_FACE_COZY, BMP_FACE_FOCUS,
+      BMP_FACE_DETERMINED, BMP_FACE_DELIGHT, BMP_FACE_GUILTY,
+      BMP_FACE_DAYDREAM, BMP_FACE_GRUMPY, BMP_FACE_AMAZED
+    };
+    static const uint16_t idleDurations[] = {
+      5200, 4800, 5600, 5200, 4300, 4700,
+      5100, 5200, 5200, 5500, 5000, 4200,
+      4500, 5000, 4700, 5200, 5400, 5000,
+      5000, 5600, 5400, 5000, 4600, 5000,
+      5600, 4700, 4300
+    };
+    const uint8_t idleCount = sizeof(idleStory) / sizeof(idleStory[0]);
+    bitmapIdleFace = idleStory[bitmapIdleStoryIndex];
+    nextCuteIdleMs = now + idleDurations[bitmapIdleStoryIndex];
+    bitmapIdleStoryIndex = (bitmapIdleStoryIndex + 1) % idleCount;
   }
 
   float bitmapActionPulse = 0.0f;
   if (bitmapCalm && bitmapActionStartMs == 0 && now >= nextBitmapActionMs) {
     bitmapActionStartMs = now;
-    bitmapActionKind = (uint8_t)random(1, 5);
-    nextBitmapActionMs = now + random(4200, 8500);
+    bitmapActionKind = 1 + (bitmapIdleStoryIndex % 4);
+    nextBitmapActionMs = now + 3600UL + (bitmapIdleStoryIndex % 3) * 700UL;
   }
   if (bitmapActionStartMs != 0) {
     unsigned long actionAge = now - bitmapActionStartMs;
@@ -1838,39 +2526,105 @@ void drawMochi(bool active) {
   }
 
   BitmapMpuFace bitmapTargetFace = bitmapIdleFace;
-  if (bitmapMpuReady && (superAngryMode || angryMode)) {
-    bitmapTargetFace = BMP_FACE_ANGRY;
-  } else if (bitmapMpuReady && (now < dizzyUntilMs || now < headShakeUntilMs || shakeSmooth > 0.62f || spinSmooth > 0.32f || spinMeter > 0.38f)) {
-    bitmapTargetFace = BMP_FACE_DIZZY;
-  } else if (bitmapMpuReady && (now < freefallUntilMs || now < surprisedUntilMs)) {
-    bitmapTargetFace = BMP_FACE_SURPRISED;
+  if (manualMoodActive) {
+    switch (manualMood) {
+      case 1: bitmapTargetFace = BMP_FACE_HAPPY; break;
+      case 2: bitmapTargetFace = BMP_FACE_LOVE; break;
+      case 3: bitmapTargetFace = BMP_FACE_ANGRY; break;
+      case 4: bitmapTargetFace = BMP_FACE_SURPRISED; break;
+      case 5: bitmapTargetFace = BMP_FACE_SLEEPY; break;
+      case 6: bitmapTargetFace = BMP_FACE_SAD; break;
+      case 7: bitmapTargetFace = BMP_FACE_EXCITED; break;
+      case 8: bitmapTargetFace = BMP_FACE_SMUG; break;
+      case 9: bitmapTargetFace = BMP_FACE_SCARED; break;
+      case 10: bitmapTargetFace = BMP_FACE_COZY; break;
+      case 11: bitmapTargetFace = BMP_FACE_WOOZY; break;
+      case 12: bitmapTargetFace = BMP_FACE_CHEEKY; break;
+      case 13: bitmapTargetFace = BMP_FACE_BASHFUL; break;
+      case 14: bitmapTargetFace = BMP_FACE_FOCUS; break;
+      case 15: bitmapTargetFace = BMP_FACE_BORED; break;
+      case 16: bitmapTargetFace = BMP_FACE_NOPE; break;
+      case 17: bitmapTargetFace = BMP_FACE_PARTY; break;
+      case 18: bitmapTargetFace = BMP_FACE_RELIEVED; break;
+      case 19: bitmapTargetFace = BMP_FACE_SUS; break;
+      case 20: bitmapTargetFace = BMP_FACE_GIGGLE; break;
+      case 21: bitmapTargetFace = BMP_FACE_DETERMINED; break;
+      case 22: bitmapTargetFace = BMP_FACE_WOW; break;
+      case 23: bitmapTargetFace = BMP_FACE_MELT; break;
+      case 24: bitmapTargetFace = BMP_FACE_DELIGHT; break;
+      case 25: bitmapTargetFace = BMP_FACE_GUILTY; break;
+      case 26: bitmapTargetFace = BMP_FACE_DAYDREAM; break;
+      case 27: bitmapTargetFace = BMP_FACE_GRUMPY; break;
+      case 28: bitmapTargetFace = BMP_FACE_AMAZED; break;
+      case 29: bitmapTargetFace = BMP_FACE_CRYING; break;
+      default: bitmapTargetFace = BMP_FACE_NORMAL; break;
+    }
   } else if (active) {
     bitmapTargetFace = BMP_FACE_SING;
+  } else if (bitmapMpuReady && (superAngryMode || angryMode)) {
+    bitmapTargetFace = BMP_FACE_ANGRY;
+  } else if (bitmapMpuReady && (now < dizzyUntilMs || spinSmooth > 0.42f || spinMeter > 0.58f)) {
+    bitmapTargetFace = BMP_FACE_DIZZY;
+  } else if (bitmapMpuReady && (now < headShakeUntilMs || shakeSmooth > 0.52f || spinSmooth > 0.24f || spinMeter > 0.30f || mpuMoodWoozy > 0.50f)) {
+    bitmapTargetFace = BMP_FACE_WOOZY;
+  } else if (bitmapMpuReady && (now < freefallUntilMs || now < surprisedUntilMs)) {
+    bitmapTargetFace = mpuMoodStartle > 0.55f ? BMP_FACE_WOW : BMP_FACE_SURPRISED;
   } else if (now < touchLoveUntilMs) {
     bitmapTargetFace = BMP_FACE_LOVE;
   } else if (now < laughUntilMs) {
     bitmapTargetFace = BMP_FACE_LAUGH;
   } else if (now < touchHappyUntilMs) {
     bitmapTargetFace = BMP_FACE_HAPPY;
-  } else if (faceDownMode || now < sadUntilMs) {
+  } else if (now < touchSleepyUntilMs || (touchDown && now - touchDownMs > 2000UL)) {
     bitmapTargetFace = BMP_FACE_SLEEPY;
+  } else if (now >= cryStartMs && now < cryUntilMs) {
+    bitmapTargetFace = BMP_FACE_CRYING;
+  } else if (faceDownMode || now < sadUntilMs) {
+    bitmapTargetFace = BMP_FACE_SAD;
   } else if (now < pantUntilMs || tempMood > 0.45f) {
     bitmapTargetFace = BMP_FACE_HOT;
   } else if (tempMood < -0.45f) {
     bitmapTargetFace = BMP_FACE_COLD;
-  } else if (bitmapMpuReady && (now < annoyedUntilMs || shakeSmooth > 0.30f)) {
+  } else if (bitmapMpuReady && (now < annoyedUntilMs || mpuMoodAnnoyed > 0.62f || shakeSmooth > 0.34f)) {
     bitmapTargetFace = BMP_FACE_ANNOYED;
   } else if (bitmapMpuReady && now < nodUntilMs) {
     bitmapTargetFace = BMP_FACE_HAPPY;
-  } else if (bitmapMpuReady && (now < curiousUntilMs || fabsf(tiltX) > 0.32f || fabsf(tiltY) > 0.34f)) {
-    bitmapTargetFace = BMP_FACE_CURIOUS;
+  } else if (bitmapMpuReady && mpuMoodEnergy > 0.38f && mpuMicroMood == 7) {
+    bitmapTargetFace = BMP_FACE_PARTY;
+  } else if (bitmapMpuReady && mpuMoodEnergy > 0.26f && mpuMicroMood == 6) {
+    bitmapTargetFace = mpuMoodCurious > 0.48f ? BMP_FACE_GIGGLE : BMP_FACE_CHEEKY;
+  } else if (bitmapMpuReady && (now < curiousUntilMs || mpuMoodCurious > 0.45f || fabsf(tiltX) > 0.32f || fabsf(tiltY) > 0.34f)) {
+    bitmapTargetFace = (mpuMicroMood == 5) ? BMP_FACE_SUS : BMP_FACE_CURIOUS;
+  } else if (bitmapMpuReady && mpuMoodCalm > 0.86f && mpuMicroMood == 9) {
+    bitmapTargetFace = BMP_FACE_RELIEVED;
+  } else if (bitmapMpuReady && mpuMoodCalm > 0.82f && mpuMicroMood == 8) {
+    bitmapTargetFace = (fabsf(tiltX) < 0.10f && fabsf(tiltY) < 0.14f) ? BMP_FACE_FOCUS : BMP_FACE_COZY;
+  } else if (now < micShoutUntilMs) {
+    bitmapTargetFace = BMP_FACE_SCARED;
   } else if (now < micActiveUntilMs) {
     bitmapTargetFace = BMP_FACE_CURIOUS;
   }
 
-  if (bitmapTargetFace != bitmapShownFace) {
+  bool urgentFace =
+      manualMoodActive ||
+      active ||
+      bitmapTargetFace == BMP_FACE_ANGRY ||
+      bitmapTargetFace == BMP_FACE_DIZZY ||
+      bitmapTargetFace == BMP_FACE_WOOZY ||
+      bitmapTargetFace == BMP_FACE_SURPRISED ||
+      bitmapTargetFace == BMP_FACE_WOW ||
+      bitmapTargetFace == BMP_FACE_LOVE ||
+      bitmapTargetFace == BMP_FACE_LAUGH ||
+      bitmapTargetFace == BMP_FACE_CRYING;
+  if (bitmapTargetFace != bitmapCandidateFace) {
+    bitmapCandidateFace = bitmapTargetFace;
+    bitmapCandidateSinceMs = now;
+  }
+  unsigned long faceSettleMs = urgentFace ? 90UL : 520UL;
+  if (bitmapCandidateFace != bitmapShownFace &&
+      now - bitmapCandidateSinceMs >= faceSettleMs) {
     bitmapPreviousFace = bitmapShownFace;
-    bitmapShownFace = bitmapTargetFace;
+    bitmapShownFace = bitmapCandidateFace;
     bitmapMorphStartMs = now;
   }
 
@@ -1891,6 +2645,7 @@ void drawMochi(bool active) {
 
   if (bitmapBlinkStartMs == 0 && bitmapWinkStartMs == 0 && now >= nextBitmapBlinkMs) {
     bitmapBlinkStartMs = now;
+    bitmapDoubleBlinkPending = random(0, 7) == 0;
     nextBitmapBlinkMs = now + random(2300, active ? 4200 : 5800);
   }
 
@@ -1911,6 +2666,10 @@ void drawMochi(bool active) {
       bitmapBlinkR = b;
     } else {
       bitmapBlinkStartMs = 0;
+      if (bitmapDoubleBlinkPending) {
+        bitmapDoubleBlinkPending = false;
+        nextBitmapBlinkMs = now + 140UL;
+      }
     }
   }
   if (bitmapWinkStartMs != 0) {
@@ -1925,23 +2684,38 @@ void drawMochi(bool active) {
     }
   }
 
-  float bitmapMpuLookX = bitmapMpuReady ? clampFloat(tiltX * 2.2f, -2.5f, 2.5f) : 0.0f;
-  float bitmapMpuLookY = bitmapMpuReady ? clampFloat(tiltY * 1.5f, -1.5f, 1.5f) : 0.0f;
-  float bitmapMicroLookX = sinf(now * (active ? 0.0038f : 0.0018f)) * (active ? 1.8f : 0.8f);
-  float bitmapMicroLookY = sinf(now * 0.0013f + 1.1f) * 0.5f;
+  float bitmapMpuLookX = bitmapMpuReady ? clampFloat(tiltX * 1.45f, -1.8f, 1.8f) : 0.0f;
+  float bitmapMpuLookY = bitmapMpuReady ? clampFloat(tiltY * 0.95f, -1.2f, 1.2f) : 0.0f;
+  float moodLookBoost = bitmapMpuReady ? (0.6f + mpuMoodEnergy * 1.4f + mpuMoodCurious * 0.9f) : 0.8f;
+  float bitmapMicroLookX = sinf(now * (active ? 0.0038f : 0.0018f)) * (active ? 1.8f : moodLookBoost);
+  float bitmapMicroLookY = sinf(now * 0.0013f + 1.1f) * (0.35f + moodLookBoost * 0.18f);
   float bitmapBreathe = sinf(now * 0.0016f);
   float bitmapTinySway = sinf(now * 0.0011f + 1.4f);
   float bitmapSongPulse = active ? sinf(now * 0.0075f) * 0.8f : 0.0f;
   float bitmapShakeBob = bitmapMpuReady ? clampFloat(shakeSmooth * 2.2f, 0.0f, 2.2f) : 0.0f;
   float bitmapSpinFloat = bitmapMpuReady ? clampFloat(spinSmooth * 3.0f, 0.0f, 3.0f) : 0.0f;
-  float bitmapMotionPower = bitmapMpuReady ? clampFloat(shakeSmooth + spinSmooth * 0.8f + fabsf(tiltX) * 0.22f + fabsf(tiltY) * 0.16f, 0.0f, 1.0f) : 0.0f;
+  float bitmapMotionPower = bitmapMpuReady ? clampFloat(shakeSmooth + spinSmooth * 0.8f + fabsf(tiltX) * 0.22f + fabsf(tiltY) * 0.16f + mpuMoodEnergy * 0.45f + mpuMoodWoozy * 0.35f, 0.0f, 1.0f) : 0.0f;
   float bitmapVoicePower = active ? clampFloat(levelSmooth * 1.8f, 0.0f, 1.0f) : 0.0f;
-  float bitmapLookEase = (active || bitmapShownFace == BMP_FACE_CURIOUS || bitmapShownFace == BMP_FACE_DIZZY) ? 0.14f : 0.085f;
+  float bitmapLookEase = (active || bitmapShownFace == BMP_FACE_CURIOUS || bitmapShownFace == BMP_FACE_DIZZY) ? 0.105f : 0.060f;
   bitmapSmoothLookX += (bitmapTargetLookX + bitmapMpuLookX + bitmapMicroLookX - bitmapSmoothLookX) * bitmapLookEase;
   bitmapSmoothLookY += (bitmapTargetLookY + bitmapMpuLookY + bitmapMicroLookY - bitmapSmoothLookY) * bitmapLookEase;
 
-  int bitmapBodyX = (int)(bitmapTinySway * 0.8f + (bitmapMpuReady ? tiltX * 1.2f : 0.0f) + sinf(now * 0.006f) * bitmapSpinFloat + sinf(now * 0.0025f) * bitmapActionPulse * 2.0f);
-  int bitmapBodyY = (int)(bitmapBreathe * 1.2f + bitmapSongPulse + bitmapShakeBob + cosf(now * 0.005f) * bitmapSpinFloat * 0.6f - bitmapActionPulse * 1.8f);
+  float bitmapBodyTargetX = bitmapTinySway * (0.35f + mpuMoodCalm * 0.20f)
+      + (bitmapMpuReady ? tiltX * (0.45f + mpuMoodCurious * 0.45f) : 0.0f)
+      + sinf(now * 0.006f) * bitmapSpinFloat * 0.55f
+      + sinf(now * 0.0025f) * bitmapActionPulse * 1.2f
+      + sinf(now * 0.011f) * mpuMoodEnergy * 0.65f;
+  float bitmapBodyTargetY = bitmapBreathe * (0.45f + mpuMoodCalm * 0.25f)
+      + bitmapSongPulse * 0.65f
+      + bitmapShakeBob * 0.55f
+      + cosf(now * 0.005f) * bitmapSpinFloat * 0.30f
+      - bitmapActionPulse * 1.1f
+      - fabsf(sinf(now * 0.006f)) * mpuMoodEnergy * 0.55f;
+  float bodyEase = active ? 0.14f : 0.075f;
+  bitmapSmoothBodyX += (bitmapBodyTargetX - bitmapSmoothBodyX) * bodyEase;
+  bitmapSmoothBodyY += (bitmapBodyTargetY - bitmapSmoothBodyY) * bodyEase;
+  int bitmapBodyX = (int)roundf(bitmapSmoothBodyX);
+  int bitmapBodyY = (int)roundf(bitmapSmoothBodyY);
   int bitmapEyeX = (int)bitmapSmoothLookX;
   int bitmapEyeY = (int)bitmapSmoothLookY;
 
@@ -1962,7 +2736,14 @@ void drawMochi(bool active) {
   if (bitmapMorphing) {
     int morphPopY = -(int)(bitmapReactionPulse * 2.0f);
     int morphPopX = (int)(sinf(bitmapMorphT * 6.2831852f) * bitmapReactionPulse * 1.2f);
-    drawBitmapFaceMorph(bitmapPreviousFace, bitmapShownFace, bitmapMorphT, bitmapBodyX + morphPopX, bitmapBodyY + morphPopY);
+    int morphDx = bitmapBodyX + morphPopX;
+    int morphDy = bitmapBodyY + morphPopY;
+    drawBitmapFaceMorph(bitmapPreviousFace, bitmapShownFace, bitmapMorphT, morphDx, morphDy);
+    BitmapFaceSpec pupilFace = faceSpecFor(bitmapMorphT < 0.5f ? bitmapPreviousFace : bitmapShownFace);
+    drawBitmapPupil(pupilFace.left, morphDx, morphDy, 0, 0, 0, 0,
+                    bitmapEyeX, bitmapEyeY, bitmapBlinkL);
+    drawBitmapPupil(pupilFace.right, morphDx, morphDy, 0, 0, 0, 0,
+                    bitmapEyeX, bitmapEyeY, bitmapBlinkR);
   } else {
     drawBitmapFaceStable(bitmapShownFace, now, active, bitmapBodyX, bitmapBodyY,
                          bitmapEyeX, bitmapEyeY, bitmapBlinkL, bitmapBlinkR,
@@ -2259,6 +3040,7 @@ void drawMochi(bool active) {
   display.clearDisplay();
   
   bool isBlinkingNow = (isBlinking && blinkProgress < 0.6f) || (isWinking && winkLeft && winkProgress < 0.6f);
+  bool isWinkingRight = (isWinking && !winkLeft && winkProgress < 0.6f);
   // (Note: PixelFace handles only global blink lid=10. For full Wink we'd use WINK state, but we can just use normal blink logic)
 
   renderEmotion(targetEmo, morphStep, currentEmo, isBlinkingNow, MORPH_STEPS, dx, dy, faceLookX, faceLookY);
@@ -2461,17 +3243,73 @@ void enterDrawMode(bool clearCanvas = true) {
   }
 }
 
+void drawAssistantFace() {
+  unsigned long now = millis();
+  float phase = now * 0.012f;
+  int bob = (int)roundf(sinf(now * 0.004f));
+  int eyeY = 13 + bob;
+  const int leftX = 27;
+  const int rightX = 77;
+
+  display.clearDisplay();
+  display.setTextColor(OLED_WHITE);
+  display.setTextSize(1);
+  display.setFont(NULL);
+
+  if (voiceState == VOICE_LISTENING) {
+    int pulse = 1 + (int)(voiceLevel * 4.0f);
+    display.fillRoundRect(leftX - pulse, eyeY - pulse, 27 + pulse * 2, 34 + pulse * 2, 9, OLED_WHITE);
+    display.fillRoundRect(rightX - pulse, eyeY - pulse, 27 + pulse * 2, 34 + pulse * 2, 9, OLED_WHITE);
+    for (int i = 0; i < 7; i++) {
+      int h = 2 + (int)(voiceLevel * (3 + ((i * 3) % 8)));
+      h += (int)(fabsf(sinf(phase + i * 0.8f)) * 3.0f);
+      display.drawFastVLine(49 + i * 5, 57 - h / 2, h, OLED_WHITE);
+    }
+    display.setCursor(44, 1);
+    display.print("DENGAR");
+  } else if (voiceState == VOICE_THINKING) {
+    int look = (int)roundf(sinf(now * 0.006f) * 4.0f);
+    display.fillRoundRect(leftX + look, eyeY + 5, 27, 29, 9, OLED_WHITE);
+    display.fillRoundRect(rightX + look, eyeY + 5, 27, 29, 9, OLED_WHITE);
+    int dot = (now / 320UL) % 3;
+    for (int i = 0; i < 3; i++) {
+      if (i <= dot) display.fillCircle(57 + i * 7, 55, 2, OLED_WHITE);
+      else display.drawCircle(57 + i * 7, 55, 2, OLED_WHITE);
+    }
+    display.setCursor(47, 1);
+    display.print("MIKIR");
+  } else if (voiceState == VOICE_SPEAKING) {
+    int eyeH = 31 + (int)(sinf(now * 0.005f) * 2.0f);
+    display.fillRoundRect(leftX, eyeY, 27, eyeH, 9, OLED_WHITE);
+    display.fillRoundRect(rightX, eyeY, 27, eyeH, 9, OLED_WHITE);
+    int mouthH = 3 + (int)(levelSmooth * 10.0f);
+    mouthH += (int)(fabsf(sinf(phase)) * 4.0f);
+    display.drawRoundRect(56, 49 - mouthH / 2, 17, mouthH, 5, OLED_WHITE);
+    display.setCursor(47, 1);
+    display.print("JAWAB");
+  } else {
+    display.fillRoundRect(leftX, eyeY + 5, 27, 29, 9, OLED_WHITE);
+    display.fillRoundRect(rightX, eyeY + 5, 27, 29, 9, OLED_WHITE);
+    display.drawLine(55, 52, 61, 48, OLED_WHITE);
+    display.drawLine(61, 48, 68, 52, OLED_WHITE);
+    display.setCursor(35, 1);
+    display.print(voiceState == VOICE_ERROR ? "COBA LAGI" : "OWI");
+  }
+}
+
 void drawUI() {
   if (!oledReady) return;
   if (currentState == STATE_DRAW) return;
   display.clearDisplay();
   
-  if (currentState == STATE_MENU) {
+  if (currentState == STATE_ASSISTANT) {
+    drawAssistantFace();
+  } else if (currentState == STATE_MENU) {
     const char* menuOpts[] = {"Games", "Dht", "Reminder", "Musik", "Draw", "Kembali"};
     drawMenu("MENU UTAMA", menuOpts, 6, menuCursor);
   } else if (currentState == STATE_MUSIC) {
-    const char* musicOpts[] = {"Love Story", "MBG", "Hai", "Kembali"};
-    drawMenu("PILIH LAGU", musicOpts, 4, musicCursor);
+    const char* musicOpts[] = {"Love Story", "MBG", "Hai", "SD 0001", "Kembali"};
+    drawMenu("PILIH LAGU", musicOpts, 5, musicCursor);
   } else if (currentState == STATE_GAMES) {
     drawPingpong();
     return; // drawPingpong calls display.display() itself
@@ -2577,11 +3415,22 @@ void drawUI() {
   display.display();
 }
 
-bool setupI2S() {
+bool setupI2S(I2SPath path = I2S_PATH_AUDIO) {
+  if (i2sInstalled && activeI2SPath == path) return true;
+
+  if (i2sInstalled) {
+    i2s_driver_uninstall(I2S_NUM_0);
+    i2sInstalled = false;
+    activeI2SPath = I2S_PATH_NONE;
+    delay(8);
+  }
+
   i2s_config_t config = {};
-  config.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
+  config.mode = (path == I2S_PATH_MIC)
+                    ? (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX)
+                    : (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
   config.sample_rate = AUDIO_RATE;
-  config.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
+  config.bits_per_sample = (path == I2S_PATH_MIC) ? I2S_BITS_PER_SAMPLE_32BIT : I2S_BITS_PER_SAMPLE_16BIT;
   config.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
   config.communication_format = I2S_COMM_FORMAT_STAND_I2S;
   config.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
@@ -2594,12 +3443,21 @@ bool setupI2S() {
   i2s_pin_config_t pins = {};
   pins.bck_io_num = MAX_BCLK_PIN;
   pins.ws_io_num = MAX_LRC_PIN;
-  pins.data_out_num = MAX_DIN_PIN;
-  pins.data_in_num = I2S_PIN_NO_CHANGE;
+  pins.data_out_num = (path == I2S_PATH_MIC) ? I2S_PIN_NO_CHANGE : MAX_DIN_PIN;
+  pins.data_in_num = (path == I2S_PATH_MIC) ? MIC_SD_PIN : I2S_PIN_NO_CHANGE;
 
   if (i2s_driver_install(I2S_NUM_0, &config, 0, nullptr) != ESP_OK) return false;
-  if (i2s_set_pin(I2S_NUM_0, &pins) != ESP_OK) return false;
+  i2sInstalled = true;
+  if (i2s_set_pin(I2S_NUM_0, &pins) != ESP_OK) {
+    i2s_driver_uninstall(I2S_NUM_0);
+    i2sInstalled = false;
+    activeI2SPath = I2S_PATH_NONE;
+    return false;
+  }
   i2s_zero_dma_buffer(I2S_NUM_0);
+  activeI2SPath = path;
+  lastI2SSwitchMs = millis();
+  Serial.println(path == I2S_PATH_MIC ? "I2S mode: MIC RX D10" : "I2S mode: MAX TX D7");
   return true;
 }
 
@@ -2616,6 +3474,31 @@ void ringReset() {
   levelSmooth = 0.0f;
   lastSample = 0;
   cueSmooth = 0.0f;
+}
+
+void stopAllAudioOutput() {
+  setupI2S(I2S_PATH_AUDIO);
+  audioHttp.end();
+  audioStream = nullptr;
+  playing = false;
+  localTonePlaying = false;
+  ringReset();
+  memset(stereoSamples, 0, sizeof(stereoSamples));
+  size_t written = 0;
+  i2s_write(I2S_NUM_0, stereoSamples, sizeof(stereoSamples), &written, portMAX_DELAY);
+  touchMutedUntilMs = millis() + 900UL;
+}
+
+void startLocalMaxTone(float volume = 0.28f) {
+  stopAllAudioOutput();
+  setupI2S(I2S_PATH_AUDIO);
+  localToneVolume = clampFloat(volume, 0.05f, 0.45f);
+  localTonePlaying = true;
+  localToneFrame = 0;
+  localToneUntilMs = millis() + 1800UL;
+  touchMutedUntilMs = millis() + 2600UL;
+  currentState = STATE_FACE;
+  Serial.printf("Local MAX tone start vol=%.2f\n", localToneVolume);
 }
 
 void ringPush(const uint8_t* data, uint16_t len) {
@@ -2636,31 +3519,56 @@ bool ringPopByte(uint8_t& value) {
   return true;
 }
 
-void acceptClient() {
-  if (audioClient && audioClient.connected()) return;
-  WiFiClient next = audioServer.available();
-  if (!next) return;
+void startAudioStream(String file, String vol) {
+  setupI2S(I2S_PATH_AUDIO);
+  audioHttp.end();
+  audioStream = nullptr;
+  String url = file;
+  if (!file.startsWith("http")) {
+    url = "http://192.168.0.101:3001/stream?file=" + file + "&vol=" + vol;
+  }
+  Serial.println("Streaming audio: " + url);
+  audioHttp.begin(url);
+  int httpCode = audioHttp.GET();
+  if (httpCode == HTTP_CODE_OK) {
+    audioStream = audioHttp.getStreamPtr();
+    ringReset();
+    touchMutedUntilMs = millis() + 1200UL;
+    if (voiceState == VOICE_SPEAKING || file.startsWith("tts_cache/")) {
+      setVoiceState(VOICE_SPEAKING);
+    } else {
+      currentState = STATE_FACE;
+    }
+    gamePhase = GAME_IDLE;
+    totalBytes = 0;
+    lastAudioMs = millis();
+    Serial.println("Audio stream connected!");
+    drawStatus("HTTP AUDIO", "Streaming", "buffering...");
+  } else {
+    Serial.printf("HTTP GET failed: %d\n", httpCode);
+    audioHttp.end();
+  }
+}
 
-  if (audioClient) audioClient.stop();
-  audioClient = next;
-  audioClient.setNoDelay(true);
-  ringReset();
-  currentState = STATE_FACE;
-  gamePhase = GAME_IDLE;
-  totalBytes = 0;
-  lastAudioMs = millis();
-  Serial.println("audio client connected");
-  drawStatus("WIFI AUDIO", "Client connected", "buffering...");
+void acceptClient() {
+  // Not used anymore
 }
 
 void readClientToRing() {
-  if (!audioClient || !audioClient.connected()) return;
-  while (audioClient.available() > 0 && ringFree() > 0) {
-    int want = audioClient.available();
+  if (!audioStream || !audioStream->connected()) {
+    if (audioStream) {
+      audioStream = nullptr;
+      audioHttp.end();
+      Serial.println("Audio stream ended");
+    }
+    return;
+  }
+  while (audioStream->available() > 0 && ringFree() > 0) {
+    int want = audioStream->available();
     if (want > READ_CHUNK) want = READ_CHUNK;
     if (want > ringFree()) want = ringFree();
     if (want <= 0) return;
-    int got = audioClient.read(readBuffer, want);
+    int got = audioStream->read(readBuffer, want);
     if (got <= 0) return;
     ringPush(readBuffer, got);
     totalBytes += got;
@@ -2669,6 +3577,41 @@ void readClientToRing() {
 }
 
 void writeAudioBlock() {
+  if (localTonePlaying) {
+    if (!setupI2S(I2S_PATH_AUDIO)) return;
+    unsigned long now = millis();
+    const float freq = 880.0f;
+    const uint32_t totalFrames = (AUDIO_RATE * 1800UL) / 1000UL;
+    double sum = 0.0;
+    for (uint16_t i = 0; i < AUDIO_FRAMES; i++) {
+      float envelope = 1.0f;
+      if (localToneFrame < 1200UL) envelope = (float)localToneFrame / 1200.0f;
+      if (localToneFrame > totalFrames - 1200UL) {
+        envelope = min(envelope, (float)(totalFrames - localToneFrame) / 1200.0f);
+      }
+      if (envelope < 0.0f) envelope = 0.0f;
+      float t = (float)localToneFrame / (float)AUDIO_RATE;
+      int16_t sample = (int16_t)(sin(2.0f * PI * freq * t) * 26000.0f * localToneVolume * envelope);
+      stereoSamples[i * 2] = sample;
+      stereoSamples[i * 2 + 1] = sample;
+      sum += (double)sample * (double)sample;
+      localToneFrame++;
+    }
+    size_t written = 0;
+    i2s_write(I2S_NUM_0, stereoSamples, sizeof(stereoSamples), &written, portMAX_DELAY);
+    float rms = sqrt(sum / AUDIO_FRAMES);
+    levelSmooth = levelSmooth * 0.80f + min(1.0f, rms / 3600.0f) * 0.20f;
+    if (now > localToneUntilMs || localToneFrame >= totalFrames) {
+      localTonePlaying = false;
+      touchMutedUntilMs = millis() + 900UL;
+      levelSmooth = 0.0f;
+      memset(stereoSamples, 0, sizeof(stereoSamples));
+      i2s_write(I2S_NUM_0, stereoSamples, sizeof(stereoSamples), &written, portMAX_DELAY);
+      Serial.println("Local MAX tone done");
+    }
+    return;
+  }
+
   unsigned long now = millis();
   if (playing && now - lastAudioMs > 1200UL && ringCount < AUDIO_PREBUFFER_BYTES) {
     ringReset();
@@ -2680,11 +3623,13 @@ void writeAudioBlock() {
 
   if (!playing) {
     if (ringCount < AUDIO_PREBUFFER_BYTES) {
+      if (activeI2SPath != I2S_PATH_AUDIO) return;
       memset(stereoSamples, 0, sizeof(stereoSamples));
       size_t written = 0;
       i2s_write(I2S_NUM_0, stereoSamples, sizeof(stereoSamples), &written, portMAX_DELAY);
       return;
     }
+    if (!setupI2S(I2S_PATH_AUDIO)) return;
     playing = true;
   }
 
@@ -2720,7 +3665,9 @@ void writeAudioBlock() {
 }
 
 void setupWiFi() {
-  WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.mode(WIFI_AP_STA);
   WiFi.setSleep(false);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   drawStatus("WIFI AUDIO", "Connecting...", WIFI_SSID);
@@ -2731,17 +3678,142 @@ void setupWiFi() {
   }
 
   if (WiFi.status() != WL_CONNECTED) {
-    WiFi.mode(WIFI_AP);
     WiFi.softAP("OwiAudio", "12345678");
-    drawStatus("WIFI AP", "SSID OwiAudio", "IP 192.168.4.1");
-    Serial.println("AP mode: OwiAudio / 12345678");
+    drawStatus("WIFI RETRY", "SSID OwiAudio", "retry hotspot...");
+    Serial.println("AP+STA mode: retrying configured WiFi");
   } else {
+    WiFi.softAPdisconnect(true);
     char ip[22];
     snprintf(ip, sizeof(ip), "%s", WiFi.localIP().toString().c_str());
     drawStatus("WIFI AUDIO", ip, "Port 7777");
     Serial.print("WiFi IP: ");
     Serial.println(ip);
   }
+}
+
+void updateWiFiConnection() {
+  static unsigned long lastRetryMs = 0;
+  static bool wasConnected = false;
+  bool connected = WiFi.status() == WL_CONNECTED;
+
+  if (connected) {
+    if (!wasConnected) {
+      WiFi.softAPdisconnect(true);
+      Serial.print("WiFi reconnected: ");
+      Serial.println(WiFi.localIP());
+    }
+    wasConnected = true;
+    return;
+  }
+
+  wasConnected = false;
+  unsigned long now = millis();
+  if (now - lastRetryMs < 10000UL) return;
+  lastRetryMs = now;
+
+  Serial.println("WiFi retry...");
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+}
+
+void setVoiceState(VoiceAssistantState state) {
+  voiceState = state;
+  voiceStateMs = millis();
+  if (state == VOICE_IDLE) {
+    currentState = STATE_FACE;
+  } else {
+    currentState = STATE_ASSISTANT;
+  }
+}
+
+void beginVoiceCapture() {
+  if (voiceRecording || playing || audioStream != nullptr) return;
+  if (!webSocket.isConnected()) {
+    setVoiceState(VOICE_ERROR);
+    return;
+  }
+  if (!setupI2S(I2S_PATH_MIC)) {
+    setVoiceState(VOICE_ERROR);
+    return;
+  }
+
+  if (dfPlaying) dfPause();
+  ringReset();
+  voiceRecording = true;
+  voiceStartedMs = millis();
+  voiceSamplesSent = 0;
+  voiceLevel = 0.0f;
+  voicePacketBytes = 4;
+  memcpy(voicePacket, "MIC:", 4);
+  voicePlaybackSeen = false;
+  setVoiceState(VOICE_LISTENING);
+  webSocket.sendTXT("VOICE:START:16000");
+  Serial.println("Voice capture started");
+}
+
+void finishVoiceCapture() {
+  if (!voiceRecording) return;
+  voiceRecording = false;
+  if (voicePacketBytes > 4 && webSocket.isConnected()) {
+    webSocket.sendBIN(voicePacket, voicePacketBytes);
+  }
+  voicePacketBytes = 4;
+  setVoiceState(VOICE_THINKING);
+  webSocket.sendTXT("VOICE:END");
+  Serial.print("Voice capture finished, samples=");
+  Serial.println(voiceSamplesSent);
+}
+
+void serviceMicrophone() {
+  if (localTonePlaying || playing || audioStream != nullptr || dfPlaying) return;
+  if (!voiceRecording && millis() - lastI2SSwitchMs < 180UL) return;
+  if (!setupI2S(I2S_PATH_MIC)) return;
+
+  static int32_t rxSamples[1024];
+  size_t bytesRead = 0;
+  esp_err_t err = i2s_read(
+    I2S_NUM_0,
+    rxSamples,
+    sizeof(rxSamples),
+    &bytesRead,
+    0
+  );
+  if (err != ESP_OK || bytesRead < sizeof(int32_t) * 2) return;
+
+  const size_t slotCount = bytesRead / sizeof(int32_t);
+  double sum = 0.0;
+  int32_t peak = 0;
+  size_t monoSamples = 0;
+
+  // L/R INMP441 terhubung ke GND, jadi data suara berada di slot kiri.
+  for (size_t i = 0; i + 1 < slotCount; i += 2) {
+    int32_t mic24 = rxSamples[i] >> 8;
+    int32_t absMic = abs(mic24);
+    if (absMic > peak) peak = absMic;
+    sum += (double)mic24 * (double)mic24;
+
+    int32_t pcm = mic24 >> 7;
+    pcm = constrain(pcm, -32768, 32767);
+    if (voiceRecording) {
+      voicePacket[voicePacketBytes++] = (uint8_t)(pcm & 0xFF);
+      voicePacket[voicePacketBytes++] = (uint8_t)((pcm >> 8) & 0xFF);
+      voiceSamplesSent++;
+      if (voicePacketBytes >= sizeof(voicePacket)) {
+        if (webSocket.isConnected()) webSocket.sendBIN(voicePacket, voicePacketBytes);
+        voicePacketBytes = 4;
+        memcpy(voicePacket, "MIC:", 4);
+      }
+    }
+    monoSamples++;
+  }
+
+  if (monoSamples == 0) return;
+  float rms = sqrtf((float)(sum / monoSamples));
+  float level = constrain(rms / 260000.0f, 0.0f, 1.0f);
+  voiceLevel = voiceLevel * 0.72f + level * 0.28f;
+  micSmooth = micSmooth * 0.82f + level * 0.18f;
+  micPeak = micPeak * 0.86f + constrain((float)peak / 900000.0f, 0.0f, 1.0f) * 0.14f;
+
 }
 
 void micTask(void *pvParameters) {
@@ -2780,6 +3852,71 @@ void micTask(void *pvParameters) {
   }
 }
 
+
+void startAudioStream(String file, String vol);
+void processCommand(String cmd);
+
+void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
+  switch(type) {
+    case WStype_DISCONNECTED:
+      Serial.println("[WS] Disconnected!");
+      break;
+    case WStype_CONNECTED:
+      Serial.printf("[WS] Connected to url: %s\n", payload);
+      break;
+    case WStype_TEXT:
+      {
+        String text = (char*)payload;
+        Serial.printf("[WS] get text: %s\n", text.c_str());
+        if (text.startsWith("CMD:")) {
+          String cmd = text.substring(4);
+          processCommand(cmd);
+        } else if (text.startsWith("REMINDER:TEXT:")) {
+          String r = text.substring(14);
+          processCommand("R" + r);
+        } else if (text == "VOICE:THINKING") {
+          setVoiceState(VOICE_THINKING);
+        } else if (text == "VOICE:SPEAKING") {
+          voicePlaybackSeen = false;
+          setVoiceState(VOICE_SPEAKING);
+        } else if (text == "VOICE:DONE") {
+          setVoiceState(VOICE_IDLE);
+        } else if (text.startsWith("VOICE:ERROR")) {
+          setVoiceState(VOICE_ERROR);
+        } else if (text.startsWith("AUDIO:")) {
+          if (text == "AUDIO:STOP") {
+            stopAllAudioOutput();
+            Serial.println("Audio explicitly stopped via WS");
+          } else {
+            int firstColon = text.indexOf(':', 6);
+            if (firstColon != -1) {
+              String file = text.substring(6, firstColon);
+              String vol = text.substring(firstColon + 1);
+              if (file == "TEST") startLocalMaxTone(vol.toFloat());
+              else startAudioStream(file, vol);
+            } else {
+              startAudioStream(text.substring(6), "0.30");
+            }
+          }
+        }
+      }
+      break;
+    case WStype_BIN:
+      {
+        if (length == 1030 && memcmp(payload, "FRAME:", 6) == 0) {
+          if (oledReady) {
+            memcpy(drawFrame, payload + 6, 1024);
+            currentState = STATE_DRAW;
+            display.clearDisplay();
+            display.drawBitmap(0, 0, drawFrame, 128, 64, OLED_WHITE);
+            display.display();
+          }
+        }
+      }
+      break;
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   delay(700);
@@ -2798,21 +3935,22 @@ void setup() {
     while (true) delay(1000);
   }
 
+  // setupDFPlayer(); // Dimatikan sementara sesuai permintaan
   setupWiFi();
-  telemetryUdp.begin(TELEMETRY_PORT);
-  micUdp.begin(7799);
-  audioServer.begin();
-  audioServer.setNoDelay(true);
-  Serial.println("TCP audio server on port 7777");
+
+  webSocket.begin("212.2.253.247", 3001, "/");
+  webSocket.onEvent(webSocketEvent);
+  webSocket.setReconnectInterval(5000);
+
+  // Audio now uses HTTP streaming as a client
 }
 
-void handleSerial() {
-  while (Serial.available() > 0) {
-    String cmd = Serial.readStringUntil('\n');
-    cmd.trim();
-    if (cmd.length() == 0) continue;
+void processCommand(String cmd) {
+    if (cmd.length() == 0) return;
     unsigned long now = millis();
-    if (cmd.startsWith("H")) {
+    if (cmd.startsWith("DFP:")) {
+      processDfPlayerCommand(cmd.substring(4));
+    } else if (cmd.startsWith("H")) {
       if (cmd.length() == 2049) {
         bool ok = true;
         for (int i = 0; i < 1024; i++) {
@@ -2843,6 +3981,7 @@ void handleSerial() {
     } else if (cmd.startsWith("M")) {
       sscanf(cmd.c_str(), "M%d", &manualMood);
       manualMoodMs = now;
+      currentState = STATE_FACE;
     } else if (cmd.startsWith("R")) {
       strncpy(globalReminderText, cmd.c_str() + 1, sizeof(globalReminderText) - 1);
       globalReminderText[sizeof(globalReminderText) - 1] = '\0';
@@ -2860,7 +3999,7 @@ void handleSerial() {
       } else if (currentState == STATE_MENU) {
         menuCursor = (menuCursor + 1) % 6;
       } else if (currentState == STATE_MUSIC) {
-        musicCursor = (musicCursor + 1) % 4;
+        musicCursor = (musicCursor + 1) % 5;
       } else if (currentState == STATE_GAMES) {
         if (gamePhase == GAME_IDLE || gamePhase == GAME_OVER) {
           initPingpong(true);
@@ -2896,6 +4035,8 @@ void handleSerial() {
         } else if (musicCursor == 2) {
           currentState = STATE_FACE;
           req_song = 3;
+        } else if (musicCursor == 3) {
+          dfPlayTrack(1);
         } else {
           currentState = STATE_MENU;
           menuCursor = 3;
@@ -2937,11 +4078,20 @@ void handleSerial() {
       Serial.print("cmd: Chat -> ");
       Serial.println(chatText);
     }
+}
+
+void handleSerial() {
+  while (Serial.available() > 0) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    processCommand(cmd);
   }
 }
 
 void loop() {
   handleSerial();
+  updateWiFiConnection();
+  updateDFPlayer();
   updateTouch();
   updateMPU();
   updateDHT();
@@ -2950,15 +4100,27 @@ void loop() {
   acceptClient();
   readClientToRing();
   writeAudioBlock();
+  serviceMicrophone();
   readClientToRing();
 
   unsigned long now = millis();
-  unsigned long drawInterval = (currentState == STATE_GAMES) ? 25UL : (currentState == STATE_FACE ? 40UL : (currentState == STATE_CHAT ? 35UL : 60UL));
-  if (playing != wasPlaying || now - lastDrawMs > drawInterval) {
-    wasPlaying = playing;
+  if (voiceState == VOICE_SPEAKING && playing) voicePlaybackSeen = true;
+  if (voiceState == VOICE_SPEAKING && voicePlaybackSeen && !playing &&
+      audioStream == nullptr && ringCount < AUDIO_BLOCK_BYTES) {
+    setVoiceState(VOICE_IDLE);
+  } else if (voiceState == VOICE_ERROR && now - voiceStateMs > 2600UL) {
+    setVoiceState(VOICE_IDLE);
+  }
+
+  unsigned long drawInterval = (currentState == STATE_GAMES) ? 25UL :
+                               ((currentState == STATE_FACE || currentState == STATE_ASSISTANT ||
+                                 currentState == STATE_CHAT) ? 35UL : 60UL);
+  bool faceAudioActive = playing || dfPlaying;
+  if (faceAudioActive != wasPlaying || now - lastDrawMs > drawInterval) {
+    wasPlaying = faceAudioActive;
     lastDrawMs = now;
     if (currentState == STATE_FACE) {
-      drawMochi(playing);
+      drawMochi(faceAudioActive);
     } else {
       drawUI();
     }

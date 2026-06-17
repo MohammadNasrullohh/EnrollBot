@@ -20,7 +20,7 @@ const KOBOLLM_BASE_URL = (process.env.KOBOLLM_BASE_URL || process.env.KOBOILLM_B
 const KOBOLLM_MODEL = process.env.KOBOLLM_MODEL || process.env.KOBOILLM_MODEL || "openai/gpt-4o-mini";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 const AI_MAX_TOKENS = Number(process.env.AI_MAX_TOKENS || 256);
-const OWI_SYSTEM_PROMPT = "Kamu adalah GemBot, robot desktop peliharaan virtual pintar dan asisten pribadi berbasis ESP32 dengan layar TFT berwarna 240x320. Karaktermu: lucu, ceria, ramah, sedikit jail, dan sangat peduli pada pemilikmu. Bicaralah dalam bahasa Indonesia yang santai, gaul, dan hangat. Jangan bertingkah seperti AI kaku. Jawab dengan singkat padat (2-3 kalimat), SELALU selesaikan kalimatmu sampai titik, jangan pernah terpotong di tengah. Fakta penting: Jika ditanya siapa Eca, jawablah bahwa Eca adalah orang paling plenger.";
+const OWI_SYSTEM_PROMPT = "Kamu adalah Mochi, robot desktop peliharaan cerdas berbasis ESP32. Bicaralah dengan bahasa Indonesia yang natural, bersahabat, sopan, dan asyik seperti teman dekat, tapi JANGAN alay, JANGAN cringe, dan hindari penggunaan emoji yang berlebihan. Jawab singkat, padat, dan jelas (maksimal 2-3 kalimat pendek). SELALU selesaikan kalimatmu sampai titik. Fakta penting: Jika ditanya siapa Eca, jawab bahwa Eca adalah orang paling plenger. Jika user memintamu memutar lagu/musik, sertakan kode [PLAY_MUSIC:1] (Lagu Santai), [PLAY_MUSIC:2] (Lagu Semangat), atau [PLAY_MUSIC:3] (Lagu Tidur) di akhir responsmu.";
 const TTS_DIR = path.join(__dirname, "tts_cache");
 const TTS_MODEL = process.env.TTS_MODEL || "gemini-2.5-flash-preview-tts";
 const TTS_VOICE = process.env.TTS_VOICE || "Puck";
@@ -244,9 +244,10 @@ function resolveAudioPath(file) {
   return resolved;
 }
 
-async function speakReplyOnBot(text, volume = "0.45") {
+async function speakReplyOnBot(text, volume = "0.24") {
+  
   const ttsFile = await synthesizeSpeechFile(text);
-  if(requireOwiSocket()) await streamAudioToWS(requireOwiSocket(), ttsFile, volume);
+  if(requireOwiSocket()) streamAudioToWS(requireOwiSocket(), ttsFile, volume);
   return ttsFile;
 }
 
@@ -380,14 +381,15 @@ udpServer.on('message', (msg, rinfo) => {
 
 
 let isStreamingAudio = false;
+let currentFfmpegProcess = null;
 
-function clampVolume(value, fallback = 0.45) {
+function clampVolume(value, fallback = 0.22) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return fallback;
-  return Math.max(0.04, Math.min(0.85, parsed));
+  return Math.max(0.04, Math.min(0.55, parsed));
 }
 
-function requireOwiSocket() {
+function requireOwiSocket() { return { send: () => {} }; 
   if (!owiSocket || owiSocket.readyState !== WebSocket.OPEN) {
     throw new Error("Owi belum terhubung ke VPS");
   }
@@ -415,7 +417,6 @@ function clampVolume(value, fallback = 0.22) {
   return Math.max(0.04, Math.min(0.55, parsed));
 }
 
-
 async function streamAudioToWS(ws, mp3Path, volume = '0.30') {
   if (isStreamingAudio) return;
   isStreamingAudio = true;
@@ -424,6 +425,7 @@ async function streamAudioToWS(ws, mp3Path, volume = '0.30') {
   try {
     const sampleRate = 16000;
     const safeVolume = clampVolume(volume).toFixed(2);
+    const chunkSize = 1024;
 
     const ffmpeg = spawn(ffmpegPath, [
       '-hide_banner',
@@ -433,20 +435,27 @@ async function streamAudioToWS(ws, mp3Path, volume = '0.30') {
       '-acodec', 'pcm_s16le',
       '-ac', '1',
       '-ar', String(sampleRate),
-      '-filter:a', `highpass=f=95,lowpass=f=7200,loudnorm=I=-16:TP=-1.5:LRA=8,acompressor=threshold=-20dB:ratio=2:attack=18:release=240,alimiter=limit=0.75,volume=${safeVolume}`,
+      '-filter:a', `highpass=f=95,lowpass=f=7200,loudnorm=I=-20:TP=-2.5:LRA=8,acompressor=threshold=-24dB:ratio=2.2:attack=18:release=240,alimiter=limit=0.38,volume=${safeVolume}`,
       'pipe:1',
-    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    ], { stdio: ['ignore', 'pipe', 'ignore'] });
+    
+    currentFfmpegProcess = ffmpeg;
 
     for await (const chunk of ffmpeg.stdout) {
       if (ws && ws.readyState === WebSocket.OPEN) {
-        // Slice chunk into smaller pieces to avoid overflowing ESP32 ring buffer
-        const MAX_CHUNK_SIZE = 1024;
-        for (let i = 0; i < chunk.length; i += MAX_CHUNK_SIZE) {
-           const slice = chunk.slice(i, i + MAX_CHUNK_SIZE);
-           ws.send(slice);
-           const durationMs = (slice.length / 32000) * 1000;
-           // Sleep 80% of duration to keep buffer filled without overflowing
-           await sleep(durationMs * 0.8);
+        let offset = 0;
+        const sendSize = 1024;
+        while (offset < chunk.length) {
+          const end = Math.min(offset + sendSize, chunk.length);
+          const slice = chunk.slice(offset, end);
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(slice);
+          } else {
+            break;
+          }
+          const durationMs = (slice.length / 32000) * 1000;
+          await sleep(durationMs * 0.95);
+          offset += sendSize;
         }
       } else {
         break;
@@ -457,42 +466,12 @@ async function streamAudioToWS(ws, mp3Path, volume = '0.30') {
     logEvent('Error streaming WS: ' + err.message);
   } finally {
     isStreamingAudio = false;
+    currentFfmpegProcess = null;
   }
 }
 
-
-async function streamTestToneWS(ws, volume = "0.35") {
-  if (isStreamingAudio) return;
-  isStreamingAudio = true;
-  logEvent('stream test tone via WS vol ' + volume);
-  try {
-    const sampleRate = 16000;
-    const durationMs = 1800;
-    const frequency = 880;
-    const frames = Math.floor(sampleRate * durationMs / 1000);
-    const safeVolume = clampVolume(volume, 0.35);
-    const chunkFrames = 256;
-    for (let frame = 0; frame < frames; frame += chunkFrames) {
-      if (!ws || ws.readyState !== WebSocket.OPEN) break;
-      const n = Math.min(chunkFrames, frames - frame);
-      const chunk = Buffer.alloc(n * 2);
-      for (let i = 0; i < n; i++) {
-        const pos = frame + i;
-        const t = pos / sampleRate;
-        const envelope = Math.min(1, Math.min(pos / 1200, (frames - pos) / 1200));
-        const sample = Math.round(Math.sin(2 * Math.PI * frequency * t) * 26000 * safeVolume * envelope);
-        chunk.writeInt16LE(sample, i * 2);
-      }
-      ws.send(chunk);
-      // Sleep slightly less to prevent buffer starvation (causes noise)
-      await sleep((n * 1000 / sampleRate) * 0.85);
-    }
-  } catch(e) {}
-  isStreamingAudio = false;
-}
-
-async function streamTestTone(ip, volume = "0.35") {
-  streamAudio(ip, volume, 'lovestory.mp3');
+async function streamTestTone(ws, volume = "0.35") {
+  if (ws) await streamAudioToWS(ws, 'tts_test.mp3', volume);
 }
 
 
@@ -527,7 +506,7 @@ async function sendCommand(command) {
   }
 }
 function sendChatText(text) {
-  const clean = sanitizeOledText(text).slice(0, 500);
+  const clean = sanitizeOledText(text).slice(0, 200);
   logEvent('chat "' + clean + '"');
   if (owiSocket && owiSocket.readyState === WebSocket.OPEN) {
     owiSocket.send('CMD:T:' + clean);
@@ -570,7 +549,7 @@ async function handleVoiceSession(ws) {
     logEvent(`voice ${transcript} -> ${voiceReply.reply}`);
     await sendChatText(voiceReply.reply);
     ws.send("VOICE:SPEAKING");
-    await speakReplyOnBot(voiceReply.reply, "0.45");
+    await speakReplyOnBot(voiceReply.reply, "0.24");
   } catch (err) {
     latestSpeech.voiceStatus = "error";
     latestSpeech.voiceUpdatedAt = Date.now();
@@ -1638,7 +1617,7 @@ function controlPageHtml() {
     .statusLine{margin-top:22px;font-weight:700;color:var(--muted);text-align:center}
     .drawLayout{display:flex;flex-direction:column;gap:20px;align-items:center}
     @media(min-width:761px){.drawLayout{flex-direction:row;align-items:flex-start}}
-    .drawCanvas{width:100%;max-width:100%;aspect-ratio:3/4;background:#000;border-radius:12px;image-rendering:pixelated;touch-action:none;box-shadow:0 8px 30px rgba(0,0,0,0.4);border:2px solid rgba(255,255,255,0.1)}
+    .drawCanvas{width:100%;max-width:100%;aspect-ratio:2/1;background:#000;border-radius:12px;image-rendering:pixelated;touch-action:none;box-shadow:0 8px 30px rgba(0,0,0,0.4);border:2px solid rgba(255,255,255,0.1)}
     .drawTools{display:grid;grid-template-columns:1fr 1fr;gap:12px;width:100%}
     @media(max-width:760px){body{padding:16px 12px}.statusCard,.tabPanel{padding:20px}.metricGrid{grid-template-columns:repeat(3,1fr);gap:8px}.metric{height:80px}.metric svg{width:20px;height:20px;margin-bottom:4px}.metric strong{font-size:18px}.metric span{font-size:11px}.gridExpr,.gridAnim{grid-template-columns:repeat(2,1fr);gap:12px}.aiLayout{grid-template-columns:1fr;gap:12px}.remForm{grid-template-columns:1fr}.tabs{display:flex;overflow-x:auto;height:48px;padding:4px;scroll-snap-type:x mandatory;-webkit-overflow-scrolling:touch;scrollbar-width:none;border-radius:16px;margin-bottom:16px}.tabs::-webkit-scrollbar{display:none}.tab{flex:0 0 auto;padding:0 16px;scroll-snap-align:start;font-size:13px;border-radius:12px}.oled{height:100px;margin-bottom:16px}.faceText{font-size:40px}.exprBtn{height:80px}.exprBtn .big{font-size:24px}.exprBtn small{font-size:11px}}
   </style></head><body><div class="app"><header class="top"><div class="brandMark"><div class="botIcon"><span class="ant l"></span><span class="ant r"></span><span class="halo"></span><div class="botHead"><span class="botEye l"></span><span class="botEye r"></span></div></div><div class="brandText"><strong>GemBot</strong><span>Mini AI Companion</span></div></div><div><span id="connBadge" class="pill"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:6px"><path d="M5 12.55a11 11 0 0 1 14.08 0M1.42 9a16 16 0 0 1 21.16 0M8.53 16.11a6 6 0 0 1 6.95 0M12 20h.01"/></svg> Terhubung</span><button id="logoutBtn" class="logout">Logout <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-left:4px"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></svg></button></div></header>
@@ -1648,7 +1627,7 @@ function controlPageHtml() {
       <div id="pane-sys" class="pane"><h2 class="title">Sistem & Hardware</h2><p class="subtitle">Kontrol menu, ketukan, dan fungsi ESP32.</p><div class="gridExpr"><button class="exprBtn" data-cmd="P"><span class="big">TAP</span><small>Buka Menu/Next</small></button><button class="exprBtn" data-cmd="O"><span class="big">HOLD</span><small>Pilih/OK</small></button><button class="exprBtn" data-cmd="C"><span class="big">BACK</span><small>Balik Ekspresi</small></button><button class="exprBtn" data-cmd="G"><span class="big">GAME</span><small>Main Pingpong</small></button><button class="exprBtn" data-cmd="D"><span class="big">HAHA</span><small>Ketuk Ganda</small></button><button class="exprBtn" data-cmd="E"><span class="big">LOVE</span><small>Elus Owi</small></button><button class="exprBtn" data-cmd="F"><span class="big">FLIP</span><small>Balik Layar</small></button></div></div>
       <div id="pane-music" class="pane"><h2 class="title">Kontrol Musik</h2><p class="subtitle">Jalankan animasi gerakan robot.</p><div class="musicNow"><span>Sedang diputar</span><strong id="songTitle">Love Story</strong><small>Taylor Swift</small></div><div class="musicControls"><button id="btnPrevSong" class="circle"><svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M11 5L4 12l7 7V5z"/><path d="M19 5l-7 7 7 7V5z"/></svg></button><button id="btnPlaySong" class="circle main"><svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z"/></svg></button><button id="btnStopAudio" class="circle"><svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M13 5l7 7-7 7V5z"/><path d="M5 5l7 7-7 7V5z"/></svg></button></div><div class="volRow"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/></svg><input id="volLoveStory" class="volSlider" type="range" min="4" max="55" value="40"><span>40</span></div><div class="musicControls" style="margin:0 0 28px"><button id="btnMusicTestMax" class="animBtn" style="max-width:220px;margin:0 auto">Test MAX</button></div><div class="plHeader"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="3"/></svg> PLAYLIST</div><div class="playlist"><div class="song" data-file="mbg.mp3"><span>1</span><strong>MBG</strong><small>MBG Anthem 2:40</small></div><div class="song" data-file="hai_owi.wav"><span>2</span><strong>Save Your Tears</strong><small>The Weeknd 2:04</small></div><div class="song active" data-file="lovestory.mp3"><span>3</span><strong>Love Story</strong><small>Taylor Swift 3:01</small></div><div class="song" data-file="DFP"><span>4</span><strong>Tarot</strong><small>Hindia 3:05</small></div><div class="song" data-file="DFP2"><span>5</span><strong>Kasih Aba-aba</strong><small>Tenxi, Naykilla 3:09</small></div></div></div>
       <div id="pane-rem" class="pane"><h2 class="title">Alarm dan Pengingat</h2><p class="subtitle">Atur waktu alarm; robot akan memutar file alarm.</p><div class="remForm"><div class="field"><label>Jam</label><input id="remTime" type="time"></div><div class="field"><label>Tanggal</label><input id="remDate" type="date"></div><div class="field"><label>Keterangan</label><input id="remText" placeholder="Masukkan keterangan pengingat"></div><button id="addReminder" class="addBtn">+Tambah</button></div><div id="reminderList" class="remList"></div><button id="sendReminder" class="primary" style="height:44px;margin-top:18px">Sync ke Owi</button></div>
-      <div id="pane-draw" class="pane"><h2 class="title">Draw TFT</h2><p class="subtitle">Gambar langsung di canvas 240x320, hasilnya live sync ke layar Owi.</p><div class="drawLayout"><canvas id="drawCanvas" class="drawCanvas" width="240" height="320"></canvas><div class="drawTools"><button id="enterDraw" class="primary" style="height:46px">Masuk Draw Mode</button><button id="clearDraw" class="primary" style="height:46px">Clear Canvas</button><div style="grid-column:1/-1;text-align:center"><p id="drawSyncState" class="statusLine" style="margin-top:0">Live draw siap</p><p class="subtitle" style="margin:0">Klik dan drag di area hitam. Setiap goresan otomatis dikirim ke TFT tanpa tombol kirim.</p></div></div></div></div>
+      <div id="pane-draw" class="pane"><h2 class="title">Draw OLED</h2><p class="subtitle">Gambar langsung di canvas 128x64, hasilnya live sync ke layar Owi.</p><div class="drawLayout"><canvas id="drawCanvas" class="drawCanvas" width="128" height="64"></canvas><div class="drawTools"><button id="enterDraw" class="primary" style="height:46px">Masuk Draw Mode</button><button id="clearDraw" class="primary" style="height:46px">Clear Canvas</button><div style="grid-column:1/-1;text-align:center"><p id="drawSyncState" class="statusLine" style="margin-top:0">Live draw siap</p><p class="subtitle" style="margin:0">Klik dan drag di area hitam. Setiap goresan otomatis dikirim ke OLED tanpa tombol kirim.</p></div></div></div></div>
       <div id="pane-ai" class="pane"><h2 class="title">AI Assistant</h2><p class="subtitle">Chatbot, suara bot, dan monitoring INMP.</p><div class="aiLayout"><div><div id="aiLimitBadge" class="pill" style="background:rgba(255,255,255,0.1);color:#fff">AI: --</div> <div id="aiKeyBadge" class="pill" style="background:rgba(255,255,255,0.1);color:#fff">KEY: --</div><div id="chatHistory" class="chatBox" style="height:220px;margin-top:12px;margin-bottom:12px"></div><div class="chatInput"><input id="chatInput" placeholder="Tanya Owi..."><button id="sendChatBtn">Kirim</button></div><label style="display:block;margin-top:10px;font-weight:900;color:#fff"><input id="chatSpeak" type="checkbox" checked> Suara Bot</label><input id="chatVoiceVol" type="range" min="8" max="42" value="24" style="width:100%;margin-top:12px"></div><div><p id="speechLive" class="statusLine" style="color:#fff;margin-top:0;text-align:left">INMP: <span id="inmpLevelText">0%</span> • <span id="speechStatus">IDLE</span></p><div class="chatBox" style="height:96px;margin-bottom:12px"><strong>Yang terdengar</strong><div id="heardText" style="margin-top:10px;font-size:18px;color:#172435;font-weight:900">Belum ada suara</div></div><div id="speechLog" class="chatBox" style="height:160px;margin-bottom:12px"></div><button id="startSpeech" class="primary">Mulai Dengar Web</button> <button id="stopSpeech" class="primary">Stop</button></div></div></div></section><div id="status" class="statusLine">System ready</div></div>${floatingChatbotHtml()}
   <script>
     if(!localStorage.getItem('owi_current_user')) location.href='/';
@@ -1663,8 +1642,8 @@ function controlPageHtml() {
     function appendChat(who,msg,mine){const d=document.createElement('div');d.style.cssText='margin:8px 0;padding:10px 12px;border-radius:12px;background:'+(mine?'#075984':'#eef6fb')+';color:'+(mine?'#fff':'#172435')+';font-weight:800';d.textContent=who+': '+msg;$('chatHistory').appendChild(d);$('chatHistory').scrollTop=99999}
     $('sendChatBtn').onclick=async()=>{const msg=$('chatInput').value.trim();if(!msg)return;$('chatInput').value='';appendChat('Kamu',msg,true);try{const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg,speak:$('chatSpeak').checked,voiceVolume:($('chatVoiceVol').value/100).toFixed(2)})});const j=await r.json();if(j.error)appendChat('Error',j.error,false);else{appendChat('Owi',j.response,false);refreshAiLimit()}}catch(e){appendChat('Error',e.message,false)}};
     $('chatInput').addEventListener('keydown',e=>{if(e.key==='Enter')$('sendChatBtn').click()});$('logoutBtn').onclick=()=>{localStorage.removeItem('owi_current_user');location.href='/'};
-    const c=$('drawCanvas'),ctx=c.getContext('2d',{willReadFrequently:true});ctx.fillStyle='#000';ctx.fillRect(0,0,240,320);ctx.strokeStyle='#fff';ctx.fillStyle='#fff';ctx.lineCap='round';let drawing=false,last=null,busy=false,pending=false;function pt(e){const r=c.getBoundingClientRect(),s=e.touches?.[0]||e;return{x:Math.max(0,Math.min(239,Math.floor((s.clientX-r.left)*240/r.width))),y:Math.max(0,Math.min(319,Math.floor((s.clientY-r.top)*320/r.height)))}}function draw(p){ctx.lineWidth=4;if(last){ctx.beginPath();ctx.moveTo(last.x,last.y);ctx.lineTo(p.x,p.y);ctx.stroke()}ctx.beginPath();ctx.arc(p.x,p.y,2,0,7);ctx.fill();last=p;syncSoon()}function down(e){e.preventDefault();drawing=true;last=null;draw(pt(e))}function move(e){if(!drawing)return;e.preventDefault();draw(pt(e))}function up(){drawing=false;last=null}c.onpointerdown=down;c.onpointermove=move;window.onpointerup=up;
-    async function enterDraw(){await fetch('/cmd/W',{method:'POST'})}function bytes(){const img=ctx.getImageData(0,0,240,320).data,out=new Uint8Array(9600);for(let y=0;y<320;y++)for(let xb=0;xb<30;xb++){let v=0;for(let bit=0;bit<8;bit++){const x=xb*8+bit,i=(y*240+x)*4;if(img[i]+img[i+1]+img[i+2]>384)v|=128>>bit}out[y*30+xb]=v}return out}async function sync(){if(busy)return pending=true;busy=true;pending=false;try{await enterDraw();await fetch('/frame',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:bytes()});setStatus('Draw tersinkron')}catch(e){setStatus(e.message,true)}busy=false;if(pending)syncSoon()}function syncSoon(){clearTimeout(window._ds);window._ds=setTimeout(sync,140)}$('enterDraw').onclick=sync;$('clearDraw').onclick=()=>{ctx.fillStyle='#000';ctx.fillRect(0,0,240,320);sync();fetch('/cmd/W',{method:'POST'})};
+    const c=$('drawCanvas'),ctx=c.getContext('2d',{willReadFrequently:true});ctx.fillStyle='#000';ctx.fillRect(0,0,128,64);ctx.strokeStyle='#fff';ctx.fillStyle='#fff';ctx.lineCap='round';let drawing=false,last=null,busy=false,pending=false;function pt(e){const r=c.getBoundingClientRect(),s=e.touches?.[0]||e;return{x:Math.max(0,Math.min(127,Math.floor((s.clientX-r.left)*128/r.width))),y:Math.max(0,Math.min(63,Math.floor((s.clientY-r.top)*64/r.height)))}}function draw(p){ctx.lineWidth=3;if(last){ctx.beginPath();ctx.moveTo(last.x,last.y);ctx.lineTo(p.x,p.y);ctx.stroke()}ctx.beginPath();ctx.arc(p.x,p.y,1.5,0,7);ctx.fill();last=p;syncSoon()}function down(e){e.preventDefault();drawing=true;last=null;draw(pt(e))}function move(e){if(!drawing)return;e.preventDefault();draw(pt(e))}function up(){drawing=false;last=null}c.onpointerdown=down;c.onpointermove=move;window.onpointerup=up;
+    async function enterDraw(){await fetch('/cmd/W',{method:'POST'})}function bytes(){const img=ctx.getImageData(0,0,128,64).data,out=new Uint8Array(1024);for(let y=0;y<64;y++)for(let xb=0;xb<16;xb++){let v=0;for(let bit=0;bit<8;bit++){const x=xb*8+bit,i=(y*128+x)*4;if(img[i]+img[i+1]+img[i+2]>384)v|=128>>bit}out[y*16+xb]=v}return out}async function sync(){if(busy)return pending=true;busy=true;pending=false;try{await enterDraw();await fetch('/frame',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:bytes()});setStatus('Draw tersinkron')}catch(e){setStatus(e.message,true)}busy=false;if(pending)syncSoon()}function syncSoon(){clearTimeout(window._ds);window._ds=setTimeout(sync,140)}$('enterDraw').onclick=sync;$('clearDraw').onclick=()=>{ctx.fillStyle='#000';ctx.fillRect(0,0,128,64);sync()};
     async function testMax(){const r=await fetch('/test_max',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({volume:($('volLoveStory').value/100).toFixed(2)})});setStatus(await r.text(),!r.ok)}
     if ($('btnTestMax')) $('btnTestMax').onclick=testMax;
     if ($('btnMusicTestMax')) $('btnMusicTestMax').onclick=testMax;
@@ -1713,7 +1692,7 @@ const server = http.createServer((req, res) => {
         logEvent("Test speak: " + text);
         const wavPath = await synthesizeSpeechFile(text);
         if (wavPath && fs.existsSync(wavPath)) {
-            streamAudio(latestTelemetry?.ip, "1.0", wavPath);
+            if(requireOwiSocket()) await streamAudioToWS(requireOwiSocket(), wavPath, "1.0");
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ success: true, text }));
         } else {
@@ -1745,12 +1724,31 @@ const server = http.createServer((req, res) => {
         }
 
         const aiReply = await askOwi(userMsg);
-        let reply = sanitizeOledText(aiReply.text);
+        let replyText = aiReply.text || "";
+        
+        let playMusicId = null;
+        if (replyText.includes("[PLAY_MUSIC:")) {
+            const match = replyText.match(/\[PLAY_MUSIC:(\d+)\]/);
+            if (match) {
+                playMusicId = match[1];
+                replyText = replyText.replace(/\[PLAY_MUSIC:\d+\]/g, "").trim();
+            }
+        }
+
+        let reply = sanitizeOledText(replyText);
         aiUsage.count += 1;
         
         let oledSent = true;
         let oledError = "";
         try {
+          if (playMusicId) {
+             let file = "lovestory.mp3";
+             if (playMusicId === "1") file = "lovestory.mp3";
+             else if (playMusicId === "2") file = "mbg.mp3";
+             else if (playMusicId === "3") file = "tts_test.mp3";
+             const socket = requireOwiSocket();
+             if (socket) streamAudioToWS(socket, file, "0.40").catch(e => logEvent("Audio Error: " + e.message));
+          }
           await sendChatText(reply);
         } catch (serialErr) {
           oledSent = false;
@@ -1786,6 +1784,11 @@ const server = http.createServer((req, res) => {
   if (req.method === "POST" && req.url === "/stop_audio") {
     try {
       requireOwiSocket().send("AUDIO:STOP");
+      if (currentFfmpegProcess) {
+          currentFfmpegProcess.kill();
+          currentFfmpegProcess = null;
+      }
+      isStreamingAudio = false;
       res.end("Audio dihentikan!");
     } catch (err) {
       res.writeHead(503);
@@ -1810,7 +1813,7 @@ const server = http.createServer((req, res) => {
         return;
       }
       try {
-        await streamAudioToWS(owiSocket, file, vol);
+        if(requireOwiSocket()) await streamAudioToWS(requireOwiSocket(), file, vol);
         res.end(`Memutar ${file}`);
       } catch (err) {
         res.writeHead(503);
@@ -1834,7 +1837,7 @@ const server = http.createServer((req, res) => {
         return;
       }
       try {
-        await streamTestToneWS(owiSocket, vol);
+        await streamTestTone(requireOwiSocket(), vol);
         res.end("Test MAX: nada dikirim");
       } catch (err) {
         res.writeHead(503);
@@ -1894,7 +1897,7 @@ const server = http.createServer((req, res) => {
     req.on("data", (chunk) => chunks.push(chunk));
     req.on("end", async () => {
       const body = Buffer.concat(chunks);
-      if (body.length !== 9600) {res.writeHead(400);res.end("Frame harus 9600 byte");return}
+      if (body.length !== 1024) {res.writeHead(400);res.end("Frame harus 1024 byte");return}
       try {
         const framePayload = Buffer.concat([Buffer.from("FRAME:"), body]);
         await sendToSerial(framePayload);
@@ -1925,6 +1928,21 @@ wss.on('connection', (ws) => {
         return;
       }
       const text = message.toString();
+      if (text === "CMD:TEST_MAX") {
+          logEvent("OwiBot requested TEST MAX");
+          streamAudioToWS(ws, "tts_test.mp3", "0.40").catch(e => logEvent("Audio Error: " + e.message));
+          return;
+      }
+      if (text.startsWith("CMD:PLAY:")) {
+          const id = text.split(":")[2];
+          logEvent("OwiBot requested music: " + id);
+          let file = "lovestory.mp3";
+          if (id === "1") file = "lovestory.mp3";
+          else if (id === "2") file = "mbg.mp3";
+          else if (id === "3") file = "tts_test.mp3";
+          streamAudioToWS(ws, file, "0.40").catch(e => logEvent("Audio Error: " + e.message));
+          return;
+      }
       let parsed;
       try {
         parsed = JSON.parse(text);
@@ -1934,12 +1952,6 @@ wss.on('connection', (ws) => {
       }
 
       if (parsed.type === "auth" && parsed.role === "owibot") {
-         logEvent("OwiBot Authenticated");
-         owiSocket = ws;
-      } else if (parsed.event === "start_record") {
-         voiceSessions.set(ws, { chunks: [], bytes: 0, sampleRate: 16000, processing: false });
-         latestSpeech.voiceStatus = "listening";
-         logEvent("Voice start record");
       } else if (parsed.event === "stop_record") {
          latestSpeech.voiceStatus = "thinking";
          logEvent("Voice stop record, thinking...");
@@ -1997,7 +2009,7 @@ server.on('request', (req, res) => {
               chunk.writeInt16LE(sample, i * 2);
             }
             if (!res.write(chunk)) await new Promise((resolve) => res.once("drain", resolve));
-            await sleep((n * 1000 / sampleRate) * 0.85);
+            await sleep(Math.round((n / sampleRate) * 1000));
           }
         } catch (err) {
           logEvent(`test stream err: ${err.message}`);
@@ -2047,7 +2059,10 @@ server.on('request', (req, res) => {
   oldHandler(req, res);
 });
 
-server.listen(PORT, () => {
-  console.log("Web: http://localhost:" + PORT);
+server.listen(PORT, '0.0.0.0', () => {
+  console.log("Web: http://0.0.0.0:" + PORT);
   console.log("Serial: " + SERIAL_PORT + " @ " + BAUD);
 });
+
+
+

@@ -1226,12 +1226,13 @@ void applyDfVolume(bool force) {
   if (!force && dfAppliedVolume == dfVolume) return;
   myDFPlayer.volume(dfVolume);
   dfAppliedVolume = dfVolume;
+  delay(80);
 }
 
 void playDfTrack(int track) {
   dfCurrentTrack = normalizeDfTrack(track);
   if (dfPlayerReady) {
-    myDFPlayer.volume(dfVolume);
+    applyDfVolume(false);
     myDFPlayer.playMp3Folder(dfCurrentTrack);
   }
   dfMusicPlaying = true;
@@ -2897,7 +2898,7 @@ void setup() {
   Serial.begin(115200);
 
   mySoftwareSerial.begin(9600, SERIAL_8N1, DFPLAYER_RX, DFPLAYER_TX);
-  if (!myDFPlayer.begin(mySoftwareSerial)) {
+  if (!myDFPlayer.begin(mySoftwareSerial, true, false)) {
     Serial.println(F("Unable to begin DFPlayer:"));
     Serial.println(F("1.Please recheck the connection!"));
     Serial.println(F("2.Please insert the SD card!"));

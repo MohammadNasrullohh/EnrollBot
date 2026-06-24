@@ -20,7 +20,7 @@ const KOBOLLM_BASE_URL = (process.env.KOBOLLM_BASE_URL || process.env.KOBOILLM_B
 const KOBOLLM_MODEL = process.env.KOBOLLM_MODEL || process.env.KOBOILLM_MODEL || "openai/gpt-4o-mini";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 const AI_MAX_TOKENS = Number(process.env.AI_MAX_TOKENS || 256);
-const OWI_SYSTEM_PROMPT = "Kamu adalah Mochi, robot desktop peliharaan cerdas berbasis ESP32. Bicaralah dengan bahasa Indonesia yang natural, bersahabat, sopan, dan asyik seperti teman dekat, tapi JANGAN alay, JANGAN cringe, dan hindari penggunaan emoji yang berlebihan. Jawab singkat, padat, dan jelas (maksimal 2-3 kalimat pendek). SELALU selesaikan kalimatmu sampai titik. Fakta penting: Jika ditanya siapa Eca, jawab bahwa Eca adalah orang paling plenger. Jika user memintamu memutar lagu/musik, sertakan kode [PLAY_MUSIC:1] (Lagu Santai), [PLAY_MUSIC:2] (Lagu Semangat), atau [PLAY_MUSIC:3] (Lagu Tidur) di akhir responsmu.";
+const OWI_SYSTEM_PROMPT = "Kamu adalah Owi, robot desktop peliharaan cerdas berbasis ESP32. Bicaralah dengan bahasa Indonesia yang natural, asyik, dan to-the-point layaknya teman cowok santai. JANGAN ALAY, JANGAN CRINGE. DILARANG KERAS memanggil dengan kata 'besti', 'bosku', atau 'bro'. Cukup panggil 'Bos' atau 'kamu'. Jawab sangat singkat (maksimal 2 kalimat pendek) agar tidak ngelag. Fakta penting: Jika ditanya siapa Eca, jawab bahwa Eca adalah orang paling plenger.";
 const TTS_DIR = path.join(__dirname, "tts_cache");
 const TTS_MODEL = process.env.TTS_MODEL || "gemini-2.5-flash-preview-tts";
 const TTS_VOICE = process.env.TTS_VOICE || "Puck";
@@ -103,7 +103,7 @@ async function synthesizeSpeechFile(text) {
   await fs.promises.mkdir(TTS_DIR, { recursive: true });
   const hash = crypto
     .createHash("sha1")
-    .update(`${TTS_MODEL}|${TTS_VOICE}|${TTS_RATE}|${TTS_PITCH}|${speechText}`)
+    .update(`v2|${TTS_MODEL}|${TTS_VOICE}|${TTS_RATE}|${TTS_PITCH}|${speechText}`)
     .digest("hex")
     .slice(0, 18);
   const fileName = `tts_${hash}.wav`;
@@ -171,7 +171,7 @@ async function synthesizeGeminiTtsToWav(text, filePath) {
     model: TTS_MODEL,
     contents: [{
       parts: [{
-        text: `Say in Indonesian with a cute cheerful small desktop robot voice, clear and not too fast: ${text}`,
+        text: text,
       }],
     }],
     config: {
@@ -417,7 +417,7 @@ function clampVolume(value, fallback = 0.22) {
   return Math.max(0.04, Math.min(0.55, parsed));
 }
 
-async function streamAudioToWS(ws, mp3Path, volume = '0.30') {
+async function streamAudioToWS(ws, mp3Path, volume = '0.85') {
   if (isStreamingAudio) return;
   isStreamingAudio = true;
   logEvent('stream audio ' + mp3Path + ' via WS vol ' + volume);
@@ -453,8 +453,6 @@ async function streamAudioToWS(ws, mp3Path, volume = '0.30') {
           } else {
             break;
           }
-          const durationMs = (slice.length / 32000) * 1000;
-          await sleep(durationMs * 0.95);
           offset += sendSize;
         }
       } else {
@@ -1539,7 +1537,7 @@ function controlPageHtml() {
         body: JSON.stringify({
           message: msg,
           speak: !!(chatSpeak && chatSpeak.checked),
-          voiceVolume: chatVoiceVol ? (Number(chatVoiceVol.value) / 100).toFixed(2) : '0.24'
+          voiceVolume: chatVoiceVol ? (Number(chatVoiceVol.value) / 100).toFixed(2) : '0.85'
         })
       })
       .then(r => r.json())
@@ -1715,7 +1713,7 @@ const server = http.createServer((req, res) => {
         const data = JSON.parse(Buffer.concat(chunks).toString() || "{}");
         const userMsg = sanitizeOledText(data.message || "Halo");
         const speak = data.speak !== false;
-        const voiceVolume = clampVolume(data.voiceVolume, 0.24).toFixed(2);
+        const voiceVolume = clampVolume(data.voiceVolume, 0.85).toFixed(2);
         const limitStatus = getAiLimitStatus();
         if (limitStatus.remaining <= 0) {
           res.writeHead(429, { "Content-Type": "application/json" });

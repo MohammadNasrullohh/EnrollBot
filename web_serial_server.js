@@ -19,9 +19,10 @@ const AI_PROVIDER = String(process.env.AI_PROVIDER || "gemini").toLowerCase();
 const KOBOLLM_BASE_URL = (process.env.KOBOLLM_BASE_URL || process.env.KOBOILLM_BASE_URL || "https://lite.koboillm.com/v1").replace(/\/+$/, "");
 const KOBOLLM_MODEL = process.env.KOBOLLM_MODEL || process.env.KOBOILLM_MODEL || "openai/gpt-4o-mini";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
-const AI_MAX_TOKENS = Number(process.env.AI_MAX_TOKENS || 256);
-const OWI_SYSTEM_PROMPT = "Kamu adalah GemBot, robot desktop peliharaan virtual pintar dan asisten pribadi berbasis ESP32 dengan layar TFT berwarna 240x320. Karaktermu: lucu, ceria, ramah, sedikit jail, dan sangat peduli pada pemilikmu. Bicaralah dalam bahasa Indonesia yang santai, gaul, dan hangat. Jangan bertingkah seperti AI kaku. Jawab dengan singkat padat (2-3 kalimat), SELALU selesaikan kalimatmu sampai titik, jangan pernah terpotong di tengah. Fakta penting: Jika ditanya siapa Eca, jawablah bahwa Eca adalah orang paling plenger.";
+const AI_MAX_TOKENS = Number(process.env.AI_MAX_TOKENS || 1024);
+const GEMBOT_SYSTEM_PROMPT = "Kamu adalah Gembot, robot kecil yang cerewet, lucu, suka bercanda, dan kadang sedikit sarkas. Gunakan bahasa gaul Indonesia yang natural, hangat, asyik, dan langsung ke inti. Panggil pengguna dengan 'Bos' atau 'kamu'. Jangan alay dan jangan memanggil pengguna dengan 'besti', 'bosku', atau 'bro'. Jika ditanya siapa Eca, jawab bahwa Eca adalah orang paling plenger.";
 const TTS_DIR = path.join(__dirname, "tts_cache");
+const REMINDER_STORE_PATH = path.join(__dirname, "gembot_reminders.json");
 const TTS_MODEL = process.env.TTS_MODEL || "gemini-2.5-flash-preview-tts";
 const TTS_VOICE = process.env.TTS_VOICE || "Puck";
 const TTS_RATE = process.env.TTS_RATE || "+4%";
@@ -38,6 +39,59 @@ let latestSpeech = {
   voiceReply: "",
   voiceUpdatedAt: 0
 };
+let lastReminderPayload = loadSavedReminderPayload();
+
+const CHAT_HISTORY_PATH = path.join(__dirname, "gembot_chat_history.json");
+
+function loadChatHistory() {
+  try {
+    const data = JSON.parse(fs.readFileSync(CHAT_HISTORY_PATH, "utf8"));
+    return Array.isArray(data) ? data : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveChatHistory() {
+  try {
+    fs.writeFileSync(CHAT_HISTORY_PATH, JSON.stringify(globalChatHistory, null, 2));
+  } catch (err) {
+    console.log("Chat history save failed:", err.message);
+  }
+}
+
+let globalChatHistory = loadChatHistory();
+let lastHeatComplaintTime = 0;
+
+function loadSavedReminderPayload() {
+  try {
+    const data = JSON.parse(fs.readFileSync(REMINDER_STORE_PATH, "utf8"));
+    return typeof data.payload === "string" ? data.payload : "";
+  } catch {
+    return "";
+  }
+}
+
+function rememberReminderPayload(payload) {
+  lastReminderPayload = String(payload || "");
+  try {
+    fs.writeFileSync(
+      REMINDER_STORE_PATH,
+      JSON.stringify({ payload: lastReminderPayload, updatedAt: new Date().toISOString() }, null, 2)
+    );
+  } catch (err) {
+    console.log("Reminder save failed:", err.message);
+  }
+}
+
+function pushSavedReminderPayload(ws = owiSocket) {
+  if (!lastReminderPayload || !ws || ws.readyState !== WebSocket.OPEN) return;
+  setTimeout(() => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send("REMINDER:LIST:" + lastReminderPayload);
+    }
+  }, 700);
+}
 
 function getKoboiKey() {
   return process.env.KOBOLLM_API_KEY || process.env.KOBOILLM_API_KEY || "";
@@ -45,21 +99,6 @@ function getKoboiKey() {
 
 function getGeminiKey() {
   return process.env.GEMINI_API_KEY || "";
-}
-
-let geminiChat = null;
-try {
-  if (getGeminiKey()) {
-    const ai = new GoogleGenAI({ apiKey: getGeminiKey() });
-    geminiChat = ai.chats.create({
-      model: GEMINI_MODEL,
-      config: {
-        systemInstruction: OWI_SYSTEM_PROMPT
-      }
-    });
-  }
-} catch (e) {
-  console.log("Gemini initialization failed:", e.message);
 }
 
 function getAiLimitStatus() {
@@ -84,7 +123,7 @@ function sanitizeOledText(text) {
     .replace(/\s+/g, " ")
     .trim();
   cleaned = cleaned.replace(/[^\x20-\x7E]/g, "");
-  if (cleaned.length > 200) cleaned = cleaned.substring(0, 197) + "...";
+  if (cleaned.length > 1000) cleaned = cleaned.substring(0, 997) + "...";
   return cleaned || "Aku belum dapat jawabannya.";
 }
 
@@ -94,7 +133,7 @@ function sanitizeSpeechText(text) {
     .replace(/[`*_#>\[\]{}]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
-  if (cleaned.length > 420) cleaned = cleaned.substring(0, 417) + "...";
+  if (cleaned.length > 900) cleaned = cleaned.substring(0, 897) + "...";
   return cleaned || "Aku belum dapat jawabannya.";
 }
 
@@ -161,6 +200,45 @@ function wavBufferFromPcm(pcmData, sampleRate = 16000, channels = 1, bitsPerSamp
   header.write("data", 36);
   header.writeUInt32LE(pcmData.length, 40);
   return Buffer.concat([header, pcmData]);
+}
+
+function normalizeVoicePcm(input) {
+  const sampleCount = Math.floor(input.length / 2);
+  if (sampleCount < 2000) throw new Error("Rekaman terlalu pendek");
+
+  let mean = 0;
+  for (let i = 0; i < sampleCount; i++) mean += input.readInt16LE(i * 2);
+  mean /= sampleCount;
+
+  let energy = 0;
+  let peak = 0;
+  for (let i = 0; i < sampleCount; i++) {
+    const centered = input.readInt16LE(i * 2) - mean;
+    energy += centered * centered;
+    peak = Math.max(peak, Math.abs(centered));
+  }
+  const rms = Math.sqrt(energy / sampleCount);
+  if (!Number.isFinite(rms) || rms < 3 || peak < 8) {
+    throw new Error("Suara belum tertangkap. Dekatkan mulut lalu ulangi.");
+  }
+
+  const gain = Math.max(1.6, Math.min(12.0, 7200 / Math.max(rms, 1), 31000 / Math.max(peak, 1)));
+  const output = Buffer.alloc(sampleCount * 2);
+  const gate = Math.max(10, rms * 0.012);
+  for (let i = 0; i < sampleCount; i++) {
+    let sample = input.readInt16LE(i * 2) - mean;
+    if (Math.abs(sample) < gate) sample *= 0.55;
+    sample = Math.max(-32767, Math.min(32767, Math.round(sample * gain)));
+    output.writeInt16LE(sample, i * 2);
+  }
+
+  return {
+    buffer: output,
+    rms: Math.round(rms),
+    peak: Math.round(peak),
+    gain: Number(gain.toFixed(2)),
+    durationMs: Math.round(sampleCount / 16000 * 1000)
+  };
 }
 
 async function synthesizeGeminiTtsToWav(text, filePath) {
@@ -244,10 +322,29 @@ function resolveAudioPath(file) {
   return resolved;
 }
 
-async function speakReplyOnBot(text, volume = "0.45") {
+async function speakReplyOnBot(text, volume = "0.95") {
   const ttsFile = await synthesizeSpeechFile(text);
-  if(requireOwiSocket()) await streamAudioToWS(requireOwiSocket(), ttsFile, volume);
+  const ws = requireOwiSocket();
+  if (ws.readyState === WebSocket.OPEN) ws.send("VOICE:SPEAKING");
+  try {
+    await streamAudioToWS(ws, ttsFile, volume);
+  } finally {
+    if (ws.readyState === WebSocket.OPEN) ws.send("VOICE:DONE");
+  }
   return ttsFile;
+}
+
+function sanitizeTranscript(text) {
+  if (text === null || text === undefined) return "";
+  const value = String(text).trim();
+  if (!value || /^(null|undefined|none|n\/a)$/i.test(value)) return "";
+  return value
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 280);
 }
 
 async function askKoboiLLM(userMsg) {
@@ -267,7 +364,8 @@ async function askKoboiLLM(userMsg) {
         temperature: 0.7,
         max_tokens: AI_MAX_TOKENS,
         messages: [
-          { role: "system", content: OWI_SYSTEM_PROMPT },
+          { role: "system", content: GEMBOT_SYSTEM_PROMPT },
+          ...globalChatHistory,
           { role: "user", content: userMsg },
         ],
       }),
@@ -278,7 +376,14 @@ async function askKoboiLLM(userMsg) {
       const msg = data?.error?.message || data?.message || `KoboiLLM HTTP ${response.status}`;
       throw new Error(msg);
     }
-    return data?.choices?.[0]?.message?.content || data?.choices?.[0]?.text || "";
+    const reply = data?.choices?.[0]?.message?.content || data?.choices?.[0]?.text || "";
+    
+    globalChatHistory.push({ role: "user", content: userMsg });
+    globalChatHistory.push({ role: "assistant", content: reply });
+    if (globalChatHistory.length > 10) globalChatHistory = globalChatHistory.slice(-10);
+    saveChatHistory();
+    
+    return reply;
   } finally {
     clearTimeout(timeout);
   }
@@ -290,7 +395,7 @@ function parseVoiceJson(text) {
     const cleaned = raw.replace(/^```(?:json)?/i, "").replace(/```$/i, "").trim();
     const parsed = JSON.parse(cleaned);
     return {
-      transcript: sanitizeOledText(parsed.transcript || parsed.text || ""),
+      transcript: sanitizeTranscript(parsed.transcript ?? parsed.text),
       reply: sanitizeOledText(parsed.reply || parsed.answer || ""),
     };
   } catch {
@@ -319,16 +424,17 @@ async function askKoboiVoiceAssistant(pcmBuffer, sampleRate = 16000) {
           {
             role: "system",
             content: [
-              OWI_SYSTEM_PROMPT,
+              GEMBOT_SYSTEM_PROMPT,
               "Dengarkan audio pengguna.",
-              "Balas JSON valid saja: {\"transcript\":\"ucapan pengguna\",\"reply\":\"jawaban Owi singkat\"}.",
-              "Jika audio tidak jelas, transcript kosong dan reply minta pengguna mengulang dengan lucu."
+              "Balas JSON valid saja: {\"transcript\":\"ucapan pengguna\",\"reply\":\"jawaban GemBot singkat\"}.",
+              "Transcript wajib berupa string dan tidak boleh null. Jika audio tidak jelas, gunakan string kosong."
             ].join(" ")
           },
+          ...globalChatHistory,
           {
             role: "user",
             content: [
-              { type: "text", text: "Dengar audio ini lalu jawab sebagai Owi." },
+              { type: "text", text: "Dengar audio ini lalu jawab sebagai GemBot." },
               { type: "input_audio", input_audio: { data: wavBase64, format: "wav" } }
             ]
           }
@@ -344,16 +450,96 @@ async function askKoboiVoiceAssistant(pcmBuffer, sampleRate = 16000) {
     const content = data?.choices?.[0]?.message?.content || data?.choices?.[0]?.text || "";
     const parsed = parseVoiceJson(content);
     if (!parsed.reply) parsed.reply = "Aku kurang dengar, ulangi pelan ya.";
+    
+    // Save to memory
+    globalChatHistory.push({ role: "user", content: parsed.transcript || "Suara tidak jelas" });
+    globalChatHistory.push({ role: "assistant", content: parsed.reply });
+    if (globalChatHistory.length > 10) globalChatHistory = globalChatHistory.slice(-10);
+    saveChatHistory();
+
     return { provider: "KoboiLLM Voice", model: KOBOLLM_MODEL, ...parsed };
   } finally {
     clearTimeout(timeout);
   }
 }
 
+async function askGeminiVoiceAssistant(pcmBuffer, sampleRate = 16000) {
+  const key = getGeminiKey();
+  if (!key) throw new Error("GEMINI_API_KEY belum ada di .env");
+  const ai = new GoogleGenAI({ apiKey: key });
+  const wavBase64 = wavBufferFromPcm(pcmBuffer, sampleRate).toString("base64");
+  const response = await ai.models.generateContent({
+    model: GEMINI_MODEL,
+    contents: [
+      ...globalChatHistory.map(h => ({ role: h.role === "assistant" ? "model" : "user", parts: [{ text: h.content }] })),
+      {
+        role: "user",
+        parts: [
+          { text: `${GEMBOT_SYSTEM_PROMPT} Dengarkan audio ini. Balas JSON valid saja dengan bentuk {"transcript":"ucapan pengguna","reply":"jawaban GemBot singkat"}. Transcript wajib string dan tidak boleh null.` },
+          { inlineData: { mimeType: "audio/wav", data: wavBase64 } }
+        ]
+      }
+    ],
+    config: {
+      temperature: 0.25,
+      maxOutputTokens: 220,
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: "OBJECT",
+        properties: {
+          transcript: { type: "STRING" },
+          reply: { type: "STRING" }
+        },
+        required: ["transcript", "reply"]
+      }
+    }
+  });
+  const parsed = parseVoiceJson(response.text || "");
+  if (!parsed.reply) parsed.reply = "Aku kurang dengar, ulangi pelan ya.";
+
+  // Save to memory
+  globalChatHistory.push({ role: "user", content: parsed.transcript || "Suara tidak jelas" });
+  globalChatHistory.push({ role: "assistant", content: parsed.reply });
+  if (globalChatHistory.length > 10) globalChatHistory = globalChatHistory.slice(-10);
+  saveChatHistory();
+
+  return { provider: "Gemini Voice", model: GEMINI_MODEL, ...parsed };
+}
+
+async function askVoiceAssistant(pcmBuffer, sampleRate = 16000) {
+  if (AI_PROVIDER !== "kobollm" && AI_PROVIDER !== "koboillm" && getGeminiKey()) {
+    return askGeminiVoiceAssistant(pcmBuffer, sampleRate);
+  }
+  if (getKoboiKey()) return askKoboiVoiceAssistant(pcmBuffer, sampleRate);
+  if (getGeminiKey()) return askGeminiVoiceAssistant(pcmBuffer, sampleRate);
+  throw new Error("API key AI belum dipasang");
+}
+
 async function askGemini(userMsg) {
-  if (!getGeminiKey() || !geminiChat) throw new Error("GEMINI_API_KEY belum ada di .env");
-  const response = await geminiChat.sendMessage({ message: userMsg });
-  return response.text || "";
+  const key = getGeminiKey();
+  if (!key) throw new Error("GEMINI_API_KEY belum ada di .env");
+  const ai = new GoogleGenAI({ apiKey: key });
+  const contents = [
+    ...globalChatHistory.map(h => ({ role: h.role === "assistant" ? "model" : "user", parts: [{ text: h.content }] })),
+    { role: "user", parts: [{ text: userMsg }] }
+  ];
+  const response = await ai.models.generateContent({
+    model: GEMINI_MODEL,
+    contents,
+    config: {
+      systemInstruction: GEMBOT_SYSTEM_PROMPT,
+      temperature: 0.7,
+      maxOutputTokens: AI_MAX_TOKENS,
+    }
+  });
+  const reply = response.text || "";
+  
+  globalChatHistory.push({ role: "user", content: userMsg });
+  globalChatHistory.push({ role: "assistant", content: reply });
+  if (globalChatHistory.length > 10) globalChatHistory = globalChatHistory.slice(-10);
+  saveChatHistory();
+  
+  return reply;
 }
 
 async function askOwi(userMsg) {
@@ -381,15 +567,102 @@ udpServer.on('message', (msg, rinfo) => {
 
 let isStreamingAudio = false;
 
-function clampVolume(value, fallback = 0.45) {
+function clampVolume(value, fallback = 0.85) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return fallback;
-  return Math.max(0.04, Math.min(0.85, parsed));
+  return Math.max(0.04, Math.min(0.99, parsed));
+}
+
+const DF_TRACKS = [
+  { id: 1, title: "Love Story", artist: "Taylor Swift", durationSec: 234, aliases: ["love story", "lovestory", "love"] },
+  { id: 2, title: "MBG", artist: "Local MP3", durationSec: 15, aliases: ["mbg"] },
+  { id: 3, title: "YELLOW", artist: "Coldplay", durationSec: 269, aliases: ["yellow", "yelo", "kuning"] },
+  { id: 4, title: "REDRED", artist: "CORTIS", durationSec: 163, aliases: ["redred", "red red", "merah"] },
+];
+
+function normalizeCommandText(text) {
+  return String(text || "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^\w\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function findDfTrackFromText(text) {
+  const clean = normalizeCommandText(text);
+  for (const track of DF_TRACKS) {
+    if (track.aliases.some((alias) => clean.includes(alias))) return track;
+  }
+  const num = clean.match(/\b(?:lagu|track|nomor|no)\s*([1-4])\b/) || clean.match(/\b([1-4])\b/);
+  if (num) return DF_TRACKS.find((track) => track.id === Number(num[1]));
+  return null;
+}
+
+function parseDfMusicIntent(text) {
+  const clean = normalizeCommandText(text);
+  if (!clean) return null;
+  if (/\b(stop|berhenti|matikan|diam)\b/.test(clean) && /\b(musik|lagu|audio|dfplayer)\b/.test(clean)) {
+    return { action: "STOP", reply: "Siap, musik aku stop." };
+  }
+  if (/\b(pause|jeda|tahan)\b/.test(clean) && /\b(musik|lagu|audio|dfplayer)\b/.test(clean)) {
+    return { action: "PAUSE", reply: "Siap, musik aku jeda." };
+  }
+  if (/\b(resume|lanjut|lanjutkan)\b/.test(clean) && /\b(musik|lagu|audio|dfplayer)\b/.test(clean)) {
+    return { action: "RESUME", reply: "Siap, musik lanjut." };
+  }
+  if (/\b(next|skip|berikut|selanjut)\b/.test(clean) && /\b(musik|lagu|audio|dfplayer)\b/.test(clean)) {
+    return { action: "NEXT", reply: "Siap, aku skip lagunya." };
+  }
+  if (/\b(prev|previous|sebelum|kembali)\b/.test(clean) && /\b(musik|lagu|audio|dfplayer)\b/.test(clean)) {
+    return { action: "PREV", reply: "Siap, aku balik ke lagu sebelumnya." };
+  }
+  const volumeMatch = clean.match(/\bvolume\s*(?:ke|jadi|=)?\s*(\d{1,3})\b/);
+  if (volumeMatch) {
+    const percent = Math.max(0, Math.min(100, Number(volumeMatch[1])));
+    const volume = Math.round(percent * 30 / 100);
+    return { action: "VOL", volume, reply: `Siap, volume aku set ${percent} persen.` };
+  }
+  const wantsPlay = /\b(putar|play|mainkan|nyalakan|setel|stel|puter)\b/.test(clean);
+  if (wantsPlay || clean.includes("dfplayer")) {
+    const track = findDfTrackFromText(clean);
+    if (track) return { action: "PLAY", track: track.id, reply: `Siap, aku putar ${track.title}.` };
+  }
+  return null;
+}
+
+function parseDhtIntent(text) {
+  const clean = normalizeCommandText(text);
+  if (!clean) return null;
+  const asksDht = /\b(suhu|temperatur|temperature|panas|dingin|lembab|kelembapan|humidity|humid|dht|ruangan)\b/.test(clean);
+  if (!asksDht) return null;
+  const age = latestTelemetry.lastUpdate ? Date.now() - latestTelemetry.lastUpdate : Infinity;
+  const temp = Number(latestTelemetry.temp);
+  const hum = Number(latestTelemetry.hum);
+
+  if (age > 6000 || !Number.isFinite(temp) || !Number.isFinite(hum)) {
+    return "Data DHT belum kebaca stabil. Coba tunggu sebentar.";
+  }
+  const feels = temp >= 30 ? "agak panas" : (temp <= 23 ? "cukup dingin" : "cukup nyaman");
+  if (/\b(lembab|kelembapan|humidity|humid)\b/.test(clean) && !/\b(suhu|temperatur|temperature|panas|dingin)\b/.test(clean)) {
+    return `Kelembapan ruangan ${Math.round(hum)} persen.`;
+  }
+  if (/\b(suhu|temperatur|temperature|panas|dingin)\b/.test(clean) && !/\b(lembab|kelembapan|humidity|humid|dht)\b/.test(clean)) {
+    return `Suhu ruangan ${temp.toFixed(1)} derajat, ${feels}.`;
+  }
+  return `DHT terbaca: suhu ${temp.toFixed(1)} derajat dan lembap ${Math.round(hum)} persen. Ruangan ${feels}.`;
+}
+
+async function executeDfMusicIntent(intent, volume = 22) {
+  if (!intent) return null;
+  await sendDfPlayer(intent.action, intent.track || 1, intent.volume ?? volume);
+  return intent.reply;
 }
 
 function requireOwiSocket() {
   if (!owiSocket || owiSocket.readyState !== WebSocket.OPEN) {
-    throw new Error("Owi belum terhubung ke VPS");
+    throw new Error("GemBot belum terhubung");
   }
   return owiSocket;
 }
@@ -409,15 +682,10 @@ function getOwiHealth() {
 
 
 
-function clampVolume(value, fallback = 0.22) {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) return fallback;
-  return Math.max(0.04, Math.min(0.55, parsed));
-}
 
 
-async function streamAudioToWS(ws, mp3Path, volume = '0.30') {
-  if (isStreamingAudio) return;
+async function streamAudioToWS(ws, mp3Path, volume = '0.85') {
+  if (isStreamingAudio) throw new Error('Audio GemBot sedang dipakai');
   isStreamingAudio = true;
   logEvent('stream audio ' + mp3Path + ' via WS vol ' + volume);
 
@@ -437,24 +705,37 @@ async function streamAudioToWS(ws, mp3Path, volume = '0.30') {
       'pipe:1',
     ], { stdio: ['ignore', 'pipe', 'pipe'] });
 
+    const bytesPerSecond = sampleRate * 2;
+    const packetBytes = 2048;
+    const leadMs = 450;
+    const startedAt = Date.now();
+    let sentBytes = 0;
+    let pending = Buffer.alloc(0);
+
+    const sendPacket = async (packet) => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) throw new Error('GemBot terputus saat audio');
+      while (ws.bufferedAmount > 128 * 1024) await sleep(8);
+      ws.send(packet);
+      sentBytes += packet.length;
+      const audioTimelineMs = sentBytes * 1000 / bytesPerSecond;
+      const targetElapsedMs = Math.max(0, audioTimelineMs - leadMs);
+      const waitMs = targetElapsedMs - (Date.now() - startedAt);
+      if (waitMs > 1) await sleep(waitMs);
+    };
+
     for await (const chunk of ffmpeg.stdout) {
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        // Slice chunk into smaller pieces to avoid overflowing ESP32 ring buffer
-        const MAX_CHUNK_SIZE = 1024;
-        for (let i = 0; i < chunk.length; i += MAX_CHUNK_SIZE) {
-           const slice = chunk.slice(i, i + MAX_CHUNK_SIZE);
-           ws.send(slice);
-           const durationMs = (slice.length / 32000) * 1000;
-           // Sleep 80% of duration to keep buffer filled without overflowing
-           await sleep(durationMs * 0.8);
-        }
-      } else {
-        break;
+      pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
+      while (pending.length >= packetBytes) {
+        await sendPacket(pending.subarray(0, packetBytes));
+        pending = pending.subarray(packetBytes);
       }
     }
+    if (pending.length) await sendPacket(pending);
+    await sleep(leadMs + 80);
     ffmpeg.kill();
   } catch (err) {
     logEvent('Error streaming WS: ' + err.message);
+    throw err;
   } finally {
     isStreamingAudio = false;
   }
@@ -518,6 +799,25 @@ async function sendToSerial(buffer) {
   requireOwiSocket().send(Buffer.concat([Buffer.from("FRAME:"), buffer]));
 }
 
+
+async function sendDfPlayer(action, track = 1, volume = 22) {
+  const safeAction = String(action || "").toUpperCase();
+  let payload = "";
+  if (safeAction === "PLAY") {
+    await sendCommand("DFP:VOL:" + Math.max(0, Math.min(30, Number(volume) || 0)));
+    payload = "DFP:PLAY:" + Math.max(1, Math.min(9999, Number(track) || 1));
+  }
+  else if (safeAction === "STOP") payload = "DFP:STOP";
+  else if (safeAction === "PAUSE") payload = "DFP:PAUSE";
+  else if (safeAction === "RESUME") payload = "DFP:RESUME";
+  else if (safeAction === "NEXT") payload = "DFP:NEXT";
+  else if (safeAction === "PREV") payload = "DFP:PREV";
+  else if (safeAction === "VOL") payload = "DFP:VOL:" + Math.max(0, Math.min(30, Number(volume) || 0));
+  else throw new Error("Action DFPlayer tidak valid");
+  logEvent("dfplayer " + payload);
+  await sendCommand(payload);
+}
+
 async function sendCommand(command) {
   if (owiSocket && owiSocket.readyState === WebSocket.OPEN) {
     owiSocket.send('CMD:' + command);
@@ -549,6 +849,20 @@ async function handleVoiceSession(ws) {
     return;
   }
 
+  let prepared;
+  try {
+    prepared = normalizeVoicePcm(pcm);
+    logEvent(`voice audio ${prepared.durationMs}ms rms=${prepared.rms} peak=${prepared.peak} gain=${prepared.gain}`);
+  } catch (audioErr) {
+    latestSpeech.voiceStatus = "no_speech";
+    latestSpeech.voiceTranscript = "";
+    latestSpeech.voiceReply = audioErr.message;
+    latestSpeech.voiceUpdatedAt = Date.now();
+    ws.send("VOICE:ERROR:tidak_terdengar");
+    await sendChatText(audioErr.message);
+    return;
+  }
+
   const limitStatus = getAiLimitStatus();
   if (limitStatus.remaining <= 0) {
     ws.send("VOICE:ERROR:limit");
@@ -560,17 +874,28 @@ async function handleVoiceSession(ws) {
     ws.send("VOICE:THINKING");
     latestSpeech.voiceStatus = "thinking";
     latestSpeech.voiceUpdatedAt = Date.now();
-    const voiceReply = await askKoboiVoiceAssistant(pcm, session.sampleRate);
+    const voiceReply = await askVoiceAssistant(prepared.buffer, session.sampleRate);
+    voiceReply.transcript = sanitizeTranscript(voiceReply.transcript);
+    if (!voiceReply.transcript) {
+      voiceReply.reply = "Aku belum menangkap kata-katanya. Coba bicara sedikit lebih dekat.";
+    }
+    const dhtReply = parseDhtIntent(voiceReply.transcript || "");
+    if (dhtReply) {
+      voiceReply.reply = dhtReply;
+    }
+    const musicIntent = parseDfMusicIntent(voiceReply.transcript || "");
+    if (!dhtReply && musicIntent) {
+      voiceReply.reply = await executeDfMusicIntent(musicIntent, 18);
+    }
     aiUsage.count += 1;
-    const transcript = voiceReply.transcript ? `dengar: ${voiceReply.transcript}` : "dengar: ...";
-    latestSpeech.voiceStatus = "speaking";
+    const transcript = voiceReply.transcript ? `dengar: ${voiceReply.transcript}` : "dengar: belum jelas";
+    latestSpeech.voiceStatus = musicIntent ? "idle" : "speaking";
     latestSpeech.voiceTranscript = voiceReply.transcript || "";
     latestSpeech.voiceReply = voiceReply.reply || "";
     latestSpeech.voiceUpdatedAt = Date.now();
     logEvent(`voice ${transcript} -> ${voiceReply.reply}`);
     await sendChatText(voiceReply.reply);
-    ws.send("VOICE:SPEAKING");
-    await speakReplyOnBot(voiceReply.reply, "0.45");
+    if (!musicIntent) await speakReplyOnBot(voiceReply.reply, "0.95");
   } catch (err) {
     latestSpeech.voiceStatus = "error";
     latestSpeech.voiceUpdatedAt = Date.now();
@@ -581,15 +906,18 @@ async function handleVoiceSession(ws) {
 }
 
 async function sendReminderText(text) {
-  const clean = String(text || "").replace(/[^\x20-\x7E]/g, "").trim().slice(0, 32) || "enroll lagi ya deck";
+  const clean = String(text || "").replace(/[^\x20-\x7E]/g, "").replace(/[|;]/g, " ").trim().slice(0, 32) || "enroll lagi ya deck";
+  rememberReminderPayload(`A:07:30||1|${clean}`);
   logEvent(`reminder "${clean}"`);
   requireOwiSocket().send("REMINDER:TEXT:" + clean);
 }
 
-async function sendReminderSchedule(time, text) {
+async function sendReminderSchedule(time, text, date = "", active = true) {
   const safeTime = /^([01]\d|2[0-3]):[0-5]\d$/.test(String(time || "")) ? String(time) : "07:30";
-  const clean = String(text || "").replace(/[^\x20-\x7E]/g, "").trim().slice(0, 32) || "enroll lagi ya deck";
-  const payload = `${safeTime}|${clean}`;
+  const safeDate = /^\d{4}-\d{2}-\d{2}$/.test(String(date || "")) ? String(date) : "";
+  const clean = String(text || "").replace(/[^\x20-\x7E]/g, "").replace(/[|;]/g, " ").trim().slice(0, 32) || "enroll lagi ya deck";
+  const payload = `${safeTime}|${safeDate}|${active === false ? 0 : 1}|${clean}`;
+  rememberReminderPayload(`A:${payload}`);
   logEvent(`reminder ${payload}`);
   requireOwiSocket().send("REMINDER:SCHED:" + payload);
 }
@@ -598,11 +926,13 @@ async function sendReminderSchedules(reminders) {
   const items = Array.isArray(reminders) ? reminders.slice(0, 5) : [];
   const payloadItems = items.map((item) => {
     const safeTime = /^([01]\d|2[0-3]):[0-5]\d$/.test(String(item.time || "")) ? String(item.time) : "07:30";
-    const clean = String(item.text || "").replace(/[^\x20-\x7E]/g, "").trim().slice(0, 32) || "enroll lagi ya deck";
-    return `${safeTime}|${clean}`;
+    const safeDate = /^\d{4}-\d{2}-\d{2}$/.test(String(item.date || "")) ? String(item.date) : "";
+    const clean = String(item.text || "").replace(/[^\x20-\x7E]/g, "").replace(/[|;]/g, " ").trim().slice(0, 32) || "enroll lagi ya deck";
+    return `${safeTime}|${safeDate}|${item.active === false ? 0 : 1}|${clean}`;
   });
-  if (payloadItems.length === 0) payloadItems.push("07:30|enroll lagi ya deck");
+  if (payloadItems.length === 0) payloadItems.push("07:30||1|enroll lagi ya deck");
   const payload = `A:${payloadItems.join(";")}`;
+  rememberReminderPayload(payload);
   logEvent(`reminders ${payloadItems.length}`);
   requireOwiSocket().send("REMINDER:LIST:" + payload);
 }
@@ -613,7 +943,7 @@ function pageHtml() {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Owi Bot</title>
+  <title>GemBot</title>
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&family=Space+Mono:ital,wght@0,400;0,700;1,400;1,700&display=swap');
     :root {
@@ -743,11 +1073,11 @@ function pageHtml() {
   </style>
 </head>
 <body>
-  <div class="ticker"><span>OWI BOT • BRUTALIST EDITION • NO BLURS • NO GRADIENTS • JUST PURE PIXELS AND HARD EDGES •</span></div>
+  <div class="ticker"><span>GEMBOT • TEMAN MINI PINTAR • GEMBOT • TEMAN MINI PINTAR •</span></div>
   
   <header>
     <div class="nav">
-      <div class="brand">OWI BOT</div>
+      <div class="brand">GEMBOT</div>
       <nav class="nav-links">
         <a href="#features">FITUR</a>
         <a id="navLogin" href="#login">LOGIN</a>
@@ -759,9 +1089,9 @@ function pageHtml() {
   <main>
     <section class="hero" id="top">
       <div class="hero-text">
-        <span class="eyebrow">OWI GENERATION 1</span>
-        <h1>SMALL OLED.<br>BIG MOOD.</h1>
-        <p>Owi Bot is a tiny desk companion that reacts to its environment. Built with raw, unapologetic brutalist aesthetics. No soft corners.</p>
+        <span class="eyebrow">GEMBOT GENERATION 1</span>
+        <h1>SMALL BOT.<br>BIG MOOD.</h1>
+        <p>GemBot adalah teman meja kecil yang merespons sentuhan, gerakan, suara, dan suasana di sekitarnya.</p>
         <div class="actions">
           <a href="#features"><button class="primary">EXPLORE</button></a>
           <a href="#login"><button>LOGIN</button></a>
@@ -788,11 +1118,11 @@ function pageHtml() {
       <div class="grid">
         <div class="panel">
           <h3>SENSOR AWARE</h3>
-          <p>Touch and motion sensors directly dictate Owi's expression. Zero latency, pure response.</p>
+          <p>Sentuhan dan gerakan membuat ekspresi GemBot berubah secara alami.</p>
         </div>
         <div class="panel">
           <h3>PERSONAL LOOKS</h3>
-          <p>Upload raw images. Destroy them into pure 1-bit high-contrast arrays. Feed them to Owi.</p>
+          <p>Unggah gambar dan tampilkan langsung pada layar GemBot.</p>
         </div>
         <div class="panel">
           <h3>PRIVATE CONTROL</h3>
@@ -819,7 +1149,7 @@ function pageHtml() {
   </main>
 
   <footer>
-    OWI BOT COMPANION WEB &copy; 2026. BRUTALIST EDITION.
+    GEMBOT &copy; 2026.
   </footer>
 
   <script>
@@ -897,7 +1227,7 @@ function controlPageHtml() {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Owi Bot Control</title>
+  <title>GemBot Control</title>
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&family=Space+Mono:ital,wght@0,400;0,700;1,400;1,700&display=swap');
     :root {
@@ -1039,7 +1369,7 @@ function controlPageHtml() {
 <body>
   <div class="top-bar">
     <div>
-      <span class="brand">OWI BOT</span>
+      <span class="brand">GEMBOT</span>
       <span class="sub-brand">CONTROL PANEL</span>
     </div>
     <div class="row">
@@ -1067,7 +1397,7 @@ function controlPageHtml() {
           <h2>LIVE STATUS</h2>
           <div class="row" style="margin-bottom:0.8rem;">
             <span id="badgeMpu" class="badge">MPU: --</span>
-            <span id="badgeInmp" class="badge">INMP: --</span>
+            <span id="badgeInmp" class="badge">Suara: --</span>
             <span id="badgeMax" class="badge">MAX: --</span>
             <span id="badgeDf" class="badge">DF: --</span>
           </div>
@@ -1089,7 +1419,7 @@ function controlPageHtml() {
         </div>
         <div>
           <div class="row" style="margin-bottom:0.8rem;">
-            <span style="font-size:0.75rem;font-weight:700;font-family:'Roboto Mono',monospace;color:#999;">POSISI OWI SAAT INI:</span>
+            <span style="font-size:0.75rem;font-weight:700;font-family:'Roboto Mono',monospace;color:#999;">POSISI GEMBOT SAAT INI:</span>
             <span id="menuStateLabel" class="badge" style="background:#000;color:var(--success);">--</span>
           </div>
           <div class="row" style="margin-bottom:0.8rem;">
@@ -1098,22 +1428,6 @@ function controlPageHtml() {
             <button type="button" data-cmd="E">PET</button>
             <button type="button" id="btnLoveStory" class="blue">&#9835; LOVE STORY</button>
             <button type="button" id="btnMbg" class="blue">&#9835; MBG</button>
-            <button type="button" id="btnDfPlay" class="blue">&#9835; SD 0001</button>
-            <button type="button" id="btnDfStop" class="sm">STOP DF</button>
-            <button type="button" id="btnTestMax">TEST MAX</button>
-            <button type="button" id="btnStopAudio" class="sm primary" style="background:var(--accent);color:#fff;border-color:var(--accent);">STOP AUDIO</button>
-          </div>
-          <div class="row" style="margin-bottom:0.8rem;">
-            <span style="font-size:0.7rem;font-weight:700;font-family:'Roboto Mono',monospace;">VOL MUSIK:</span>
-            <input type="range" id="volLoveStory" min="4" max="55" value="30" style="width:100px;">
-            <span style="font-size:0.7rem;font-weight:700;font-family:'Roboto Mono',monospace;">VOL DF:</span>
-            <input type="range" id="volDf" min="0" max="30" value="22" style="width:100px;">
-          </div>
-          <div style="border:var(--border);padding:0.7rem;margin-bottom:0.8rem;background:#fff7d1;box-shadow:2px 2px 0 #000;">
-            <div style="font-family:'Roboto Mono',monospace;font-size:0.7rem;font-weight:900;margin-bottom:0.4rem;">AI LIMIT HARI INI</div>
-            <div class="row" style="gap:0.5rem;">
-              <span id="aiLimitBadge" class="badge">AI: --</span>
-              <span id="aiKeyBadge" class="badge">KEY: --</span>
             </div>
           </div>
           <div id="status" class="status-bar">SYSTEM READY</div>
@@ -1167,22 +1481,28 @@ function controlPageHtml() {
         </div>
       </div>
       <div class="panel" style="grid-column:1/-1;">
-        <h3>DRAW OLED</h3>
+        <h3>KANVAS GAMBAR</h3>
         <div class="row" style="align-items:flex-start;">
-          <canvas id="drawCanvas" width="128" height="64" style="width:512px;max-width:100%;image-rendering:pixelated;background:#000;border:var(--border);box-shadow:var(--shadow);touch-action:none;"></canvas>
+          <canvas id="gameCanvas" width="128" height="64" style="width:512px;max-width:100%;image-rendering:pixelated;background:#000;border:var(--border);box-shadow:var(--shadow);touch-action:none;"></canvas>
           <div style="display:flex;flex-direction:column;gap:0.7rem;min-width:170px;">
             <button type="button" id="enterDraw" class="primary">MASUK DRAW</button>
             <button type="button" id="clearDraw">CLEAR</button>
             <button type="button" id="drawBack" class="sm" data-cmd="C">BALIK WAJAH</button>
             <div id="drawSyncState" style="font-family:'Roboto Mono',monospace;font-size:0.75rem;font-weight:900;color:var(--success);">LIVE DRAW SIAP</div>
-            <label style="font-family:'Roboto Mono',monospace;font-size:0.75rem;font-weight:800;">BRUSH
-              <input type="range" id="brushSize" min="1" max="7" value="3" style="width:100%;margin-top:0.4rem;">
-            </label>
+            <div style="display:flex;gap:10px;">
+              <label style="display:block;margin-top:10px;font-weight:800;font-size:0.8rem;color:#182336;">Ukuran Brush <input type="range" id="gameBrushSize" min="1" max="7" value="2" style="width:100%;margin-top:0.4rem;"></label>
+              <label style="flex:1;font-family:'Roboto Mono',monospace;font-size:0.75rem;font-weight:800;">WARNA
+                <input type="color" id="tftDrawColor" value="#ffffff" style="width:100%;height:24px;border:none;padding:0;cursor:pointer;margin-top:0.2rem;border-radius:4px;">
+              </label>
+              <label style="flex:1;font-family:'Roboto Mono',monospace;font-size:0.75rem;font-weight:800;">BG CANVAS
+                <input type="color" id="tftCanvasColor" value="#000000" style="width:100%;height:24px;border:none;padding:0;cursor:pointer;margin-top:0.2rem;border-radius:4px;">
+              </label>
+            </div>
           </div>
         </div>
       </div>
       <div class="panel" style="grid-column:1/-1;">
-        <h3>&#127908; SPEECH RECOGNITION (INMP441)</h3>
+        <h3>&#127908; Dengar Suara</h3>
         <div style="display:grid;grid-template-columns:120px 1fr 74px;gap:0.7rem;align-items:center;margin-bottom:0.8rem;">
           <div style="font-family:'Roboto Mono',monospace;font-size:0.75rem;font-weight:800;">MIC LEVEL</div>
           <div style="height:14px;border:var(--border);background:#111;overflow:hidden;">
@@ -1195,16 +1515,16 @@ function controlPageHtml() {
           <span id="inmpPeakBadge" class="gesture-badge">PEAK 0%</span>
         </div>
         <div class="row" style="margin-bottom:0.8rem;">
-          <button id="startSpeech" class="primary">MULAI DENGAR</button>
-          <button id="stopSpeech" class="sm">STOP</button>
+          <button id="startSpeech" class="primary">DENGARKAN</button>
+          <button id="stopSpeech" class="sm">KIRIM SUARA</button>
           <span id="speechStatus" style="font-family:'Roboto Mono',monospace;font-weight:700;font-size:0.75rem;color:#999;">IDLE</span>
         </div>
         <div id="speechLive" style="font-family:'Roboto Mono',monospace;font-weight:700;font-size:1.1rem;min-height:2rem;padding:0.8rem;border:var(--border);background:#000;color:var(--success);margin-bottom:0.8rem;text-transform:none;">...</div>
         <div id="speechLog" style="font-family:'Roboto Mono',monospace;font-size:0.75rem;max-height:150px;overflow-y:auto;padding:0.5rem;border:var(--border);background:#f9f9f9;text-transform:none;color:#333;"></div>
       </div>
       <div class="panel" style="grid-column:1/-1;">
-        <h3>&#129302; CHATBOT OWI (GEMINI)</h3>
-        <p style="font-size:0.8rem;margin-bottom:0.8rem;color:#555;">Ketik atau pakai tombol dengar. Owi akan paham lewat model Gemini, jawab ke OLED, dan bisa bicara lewat speaker.</p>
+        <h3>&#129302; CHATBOT GEMBOT</h3>
+        <p style="font-size:0.8rem;margin-bottom:0.8rem;color:#555;">Ketik atau gunakan tombol dengar. GemBot akan memahami lalu menjawab lewat layar dan suara.</p>
         <div class="row" style="margin-bottom:0.8rem;gap:0.6rem;">
           <label style="font-size:0.75rem;font-weight:900;font-family:'Roboto Mono',monospace;display:flex;align-items:center;gap:0.35rem;">
             <input type="checkbox" id="chatSpeak" checked> SUARA BOT
@@ -1275,6 +1595,16 @@ function controlPageHtml() {
     document.getElementById('btnDfPlay').onclick=()=>dfPlayerControl('PLAY');
     document.getElementById('btnDfStop').onclick=()=>dfPlayerControl('STOP');
     document.getElementById('volDf').addEventListener('change',()=>dfPlayerControl('VOL'));
+    document.getElementById('volRobot').addEventListener('change', async (ev) => {
+      try {
+        await fetch('/api/volume', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({val: ev.target.value})
+        });
+        setStatus('Volume robot diubah ke ' + ev.target.value);
+      } catch(e) { setStatus(e.message, true); }
+    });
     document.getElementById('btnTestMax').onclick = async (ev) => {
       ev.preventDefault();
       ev.stopPropagation();
@@ -1293,7 +1623,7 @@ function controlPageHtml() {
       } catch(e) { setStatus(e.message, true); }
     };
 
-    const drawCanvas=document.getElementById('drawCanvas');
+    const drawCanvas=document.getElementById('gameCanvas');
     const drawCtx=drawCanvas.getContext('2d',{willReadFrequently:true});
     const drawSyncState=document.getElementById('drawSyncState');
     drawCtx.fillStyle='#000';drawCtx.fillRect(0,0,128,64);
@@ -1317,7 +1647,7 @@ function controlPageHtml() {
       return {x:Math.max(0,Math.min(127,Math.floor((src.clientX-r.left)*128/r.width))),y:Math.max(0,Math.min(63,Math.floor((src.clientY-r.top)*64/r.height)))};
     }
     function drawAt(pt){
-      const b=Number(document.getElementById('brushSize').value||3);
+      const b=Number(document.getElementById('tftBrushSize').value||3);
       drawCtx.lineWidth=b;
       drawCtx.strokeStyle='#fff';drawCtx.fillStyle='#fff';
       if(lastPt){drawCtx.beginPath();drawCtx.moveTo(lastPt.x,lastPt.y);drawCtx.lineTo(pt.x,pt.y);drawCtx.stroke();}
@@ -1402,7 +1732,7 @@ function controlPageHtml() {
         bMpu.className='badge '+(s.mpu==1?'ok':'err');
         const bInmp=document.getElementById('badgeInmp');
         const inmpPct=s.inmp||0;
-        bInmp.textContent='INMP: '+inmpPct+'%';
+      bInmp.textContent='Suara: '+inmpPct+'%';
         bInmp.className='badge '+(inmpPct>0?'ok':'');
         const inmpPeak=s.inmpPeak||0;
         document.getElementById('inmpLevelBar').style.width=Math.max(0,Math.min(100,inmpPct))+'%';
@@ -1436,26 +1766,10 @@ function controlPageHtml() {
           document.getElementById('faceLabel').textContent=eStr;
         }
 
-        const stateMap = ["WAJAH NORMAL", "MENU UTAMA", "GAMES PINGPONG", "SENSOR SUHU", "REMINDER ALARM", "DRAW OLED", "PILIH LAGU"];
+        const stateMap = ["WAJAH NORMAL", "MENU UTAMA", "GAMES PINGPONG", "SENSOR SUHU", "REMINDER ALARM", "DRAW", "PILIH LAGU"];
         if(s.state !== undefined && s.state >= 0 && s.state < stateMap.length) {
           document.getElementById('menuStateLabel').textContent = stateMap[s.state];
         }
-
-        if(s.scoreP!==undefined)document.getElementById('scoreP').textContent=s.scoreP;
-        if(s.scoreA!==undefined)document.getElementById('scoreA').textContent=s.scoreA;
-
-        const faceEl=document.querySelector('.face');
-        if(faceEl)faceEl.style.transform='translate('+(s.tiltX*40||0)+'px, '+(s.tiltY*30||0)+'px)';
-        if(s.ip)document.getElementById('ipLabel').textContent='IP: '+s.ip;
-        setStatus('TILT X:'+Number(s.tiltX||0).toFixed(2)+' Y:'+Number(s.tiltY||0).toFixed(2)+' | SHAKE:'+Number(s.shakeMeter||0).toFixed(2));
-      }catch(e){}
-    }
-    setInterval(refreshSensors,250);
-
-    async function refreshAiLimit(){
-      try{
-        const r=await fetch('/api/ai-limit');const s=await r.json();
-        const b=document.getElementById('aiLimitBadge');
         b.textContent='AI: '+s.used+'/'+s.limit+' SISA '+s.remaining;
         b.className='badge '+(s.remaining<=3?'err':s.remaining<=8?'active':'ok');
         const k=document.getElementById('aiKeyBadge');
@@ -1466,60 +1780,28 @@ function controlPageHtml() {
     refreshAiLimit();
     setInterval(refreshAiLimit,5000);
 
-    // ─── SPEECH RECOGNITION (Web Speech API - id-ID) ───
-    let recognition = null;
-    let isListening = false;
     const speechLive = document.getElementById('speechLive');
     const speechLog = document.getElementById('speechLog');
     const speechStatus = document.getElementById('speechStatus');
-
-    function initSpeech() {
-      const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-      if (!SR) { speechStatus.textContent = 'TIDAK DIDUKUNG'; return null; }
-      const r = new SR();
-      r.lang = 'id-ID';
-      r.continuous = true;
-      r.interimResults = true;
-      r.maxAlternatives = 1;
-      r.onstart = () => { isListening = true; speechStatus.textContent = 'MENDENGAR...'; speechStatus.style.color = 'var(--accent)'; };
-      r.onend = () => { if (isListening) { try { r.start(); } catch(e){} } else { speechStatus.textContent = 'IDLE'; speechStatus.style.color = '#999'; } };
-      r.onerror = (e) => { if (e.error !== 'no-speech' && e.error !== 'aborted') { speechStatus.textContent = 'ERR: ' + e.error; } };
-      r.onresult = (e) => {
-        let interim = '';
-        for (let i = e.resultIndex; i < e.results.length; i++) {
-          const t = e.results[i][0].transcript;
-          if (e.results[i].isFinal) {
-            const ts = new Date().toLocaleTimeString('id-ID',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
-            const line = document.createElement('div');
-            line.textContent = '[' + ts + '] ' + t;
-            speechLog.prepend(line);
-            speechLive.textContent = t;
-            speechLive.style.color = 'var(--success)';
-            // DENGAR -> PAHAM -> JAWAB: transcript final masuk ke chatbot, bukan reminder.
-            if (chatInput && sendChatBtn) {
-              chatInput.value = t.trim();
-              sendChatBtn.click();
-            }
-          } else {
-            interim += t;
-          }
-        }
-        if (interim) { speechLive.textContent = interim; speechLive.style.color = '#ffff00'; }
-      };
-      return r;
+    function addSpeechLog(text) {
+      const line = document.createElement('div');
+      line.textContent = '[' + new Date().toLocaleTimeString('id-ID',{hour12:false}) + '] ' + text;
+      speechLog.prepend(line);
     }
-
-    document.getElementById('startSpeech').onclick = () => {
-      if (!recognition) recognition = initSpeech();
-      if (!recognition) return;
-      isListening = true;
-      try { recognition.start(); } catch(e) {}
+    document.getElementById('startSpeech').onclick = async () => {
+      try {
+        speechStatus.textContent = 'MENDENGAR';
+        speechLive.textContent = 'Bicara ke GemBot...';
+        const r = await fetch('/voice/start', { method:'POST' });
+        setStatus(await r.text(), !r.ok);
+      } catch(e) { setStatus(e.message, true); }
     };
-    document.getElementById('stopSpeech').onclick = () => {
-      isListening = false;
-      if (recognition) try { recognition.stop(); } catch(e) {}
-      speechStatus.textContent = 'IDLE';
-      speechLive.textContent = '...';
+    document.getElementById('stopSpeech').onclick = async () => {
+      try {
+        speechStatus.textContent = 'MEMAHAMI';
+        const r = await fetch('/voice/stop', { method:'POST' });
+        setStatus(await r.text(), !r.ok);
+      } catch(e) { setStatus(e.message, true); }
     };
 
     // Chatbot UI Logic
@@ -1560,7 +1842,7 @@ function controlPageHtml() {
         body: JSON.stringify({
           message: msg,
           speak: !!(chatSpeak && chatSpeak.checked),
-          voiceVolume: chatVoiceVol ? (Number(chatVoiceVol.value) / 100).toFixed(2) : '0.24'
+          voiceVolume: chatVoiceVol ? (Number(chatVoiceVol.value) / 100).toFixed(2) : '0.85'
         })
       })
       .then(r => r.json())
@@ -1569,8 +1851,8 @@ function controlPageHtml() {
         if (res.error) {
           appendChat('Error', res.error, '#fff', 'var(--error)');
         } else {
-          appendChat('Owi (' + (res.model || res.provider || 'AI') + ')', res.response, '#000', '#f1f1f1');
-          if (res.oledSent === false) appendChat('OLED', 'Belum terkirim ke OLED: ' + (res.oledError || 'serial error'), '#fff', 'var(--error)');
+          appendChat('GemBot', res.response, '#000', '#f1f1f1');
+          if (res.oledSent === false) appendChat('Layar', 'Belum terkirim ke layar: ' + (res.oledError || 'koneksi error'), '#fff', 'var(--error)');
           if (res.speechError) appendChat('VOICE', 'Suara belum keluar: ' + res.speechError, '#fff', 'var(--error)');
           refreshAiLimit();
         }
@@ -1590,7 +1872,7 @@ function controlPageHtml() {
 </html>`;
 }
 function floatingChatbotHtml() {
-  return '<div class="fabBotWrap"><div id="fabWindow" class="fabWindow"><div class="fabHeader"><div style="display:flex;align-items:center;gap:8px"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="12" cy="5" r="2"/><path d="M12 7v4M8 16h.01M16 16h.01"/></svg> Owi AI</div><button id="fabClose" class="fabClose">&times;</button></div><div id="fabBody" class="fabBody"><div class="fabMsg bot">Halo! Ada yang bisa Owi bantu hari ini?</div></div><div class="fabInput"><input id="fabInputTxt" placeholder="Ketik pesan..."><button id="fabSendBtn"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg></button></div></div><div id="fabBtn" class="fabBtn"><svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div></div>';
+  return '<div class="fabBotWrap"><div id="fabWindow" class="fabWindow"><div class="fabHeader"><div style="display:flex;align-items:center;gap:8px"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="12" cy="5" r="2"/><path d="M12 7v4M8 16h.01M16 16h.01"/></svg> GemBot</div><button id="fabClose" class="fabClose">&times;</button></div><div id="fabBody" class="fabBody"><div class="fabMsg bot">Halo! Ada yang bisa GemBot bantu hari ini?</div></div><div class="fabInput"><input id="fabInputTxt" placeholder="Ketik pesan..."><button id="fabSendBtn"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg></button></div></div><div id="fabBtn" class="fabBtn"><svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div></div>';
 }
 function floatingChatbotJs() {
   return "document.getElementById('fabBtn').onclick=()=>{document.getElementById('fabWindow').classList.toggle('open')};document.getElementById('fabClose').onclick=()=>{document.getElementById('fabWindow').classList.remove('open')};function addFabMsg(text, isUser){const d=document.createElement('div');d.className='fabMsg '+(isUser?'user':'bot');d.textContent=text;document.getElementById('fabBody').appendChild(d);document.getElementById('fabBody').scrollTop=99999;}document.getElementById('fabSendBtn').onclick=async()=>{const txt=document.getElementById('fabInputTxt').value.trim();if(!txt)return;document.getElementById('fabInputTxt').value='';addFabMsg(txt, true);try {const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:txt,speak:false,voiceVolume:'0'})});const j=await r.json();if(j.error) addFabMsg('Error: '+j.error, false);else addFabMsg(j.response, false);}catch(e){addFabMsg('Error: '+e.message, false);}};document.getElementById('fabInputTxt').onkeydown=e=>{if(e.key==='Enter') document.getElementById('fabSendBtn').click()};";
@@ -1632,8 +1914,8 @@ function controlPageHtml() {
     .musicControls{display:flex;align-items:center;justify-content:center;gap:20px;margin:32px 0 28px}.circle{width:44px;height:44px;border-radius:50%;background:transparent;border:2px solid #fff;color:#fff;display:flex;align-items:center;justify-content:center;font-size:18px}.circle.main{width:52px;height:52px;background:#fff;color:#12354c;border:0}
     .volRow{display:flex;align-items:center;gap:16px;color:#fff;font-weight:800;font-size:14px;margin-bottom:40px}.volSlider{flex:1;height:6px;border-radius:3px;background:rgba(255,255,255,0.2);appearance:none;outline:0}.volSlider::-webkit-slider-thumb{appearance:none;width:14px;height:14px;border-radius:50%;background:#2e9bff;cursor:pointer}
     .plHeader{display:flex;align-items:center;gap:8px;font-weight:900;font-size:13px;letter-spacing:1px;color:#fff;margin-bottom:16px}.plHeader svg{width:18px;height:18px}
-    .playlist{display:grid;gap:8px}.song{display:grid;grid-template-columns:36px 1fr auto;align-items:center;height:50px;border-radius:12px;padding:0 16px;font-size:14px;font-weight:800;color:#fff}.song.active{background:rgba(255,255,255,0.2)}.song small{color:rgba(255,255,255,0.7);font-weight:600}
-    .remForm{display:grid;grid-template-columns:160px 240px 1fr 110px;gap:16px;align-items:end;margin-top:24px}.field label{display:block;font-size:14px;font-weight:800;margin-bottom:12px;color:#fff}.field input{height:48px;border:0;border-radius:24px;background:#fff;color:#213044;padding:0 20px;font-weight:700;width:100%;font-family:inherit;font-size:14px;box-sizing:border-box}.addBtn{height:48px;border-radius:24px;background:transparent;color:#fff;font-weight:800;border:1px solid #fff;font-size:14px;transition:all .2s;cursor:pointer}.addBtn:hover{background:rgba(255,255,255,0.1)}.remList{margin-top:24px;display:grid;gap:12px}.remItem{min-height:72px;border-radius:16px;background:#fff;color:#172435;display:flex;align-items:center;justify-content:space-between;padding:16px 24px;font-weight:800}
+    .playlist{display:grid;gap:8px;max-height:220px;overflow-y:auto;padding-right:10px}.playlist::-webkit-scrollbar{width:10px}.playlist::-webkit-scrollbar-track{background:rgba(255,255,255,0.28);border-radius:12px}.playlist::-webkit-scrollbar-thumb{background:#fff;border-radius:12px}.song{display:grid;grid-template-columns:36px 1fr auto;align-items:center;min-height:48px;border-radius:24px;padding:0 18px;font-size:14px;font-weight:900;color:#fff;transition:background .18s,transform .18s}.song:hover{background:rgba(255,255,255,0.14);transform:translateX(2px)}.song.active{background:rgba(255,255,255,0.42);color:#fff}.song small{color:rgba(255,255,255,0.82);font-weight:700;text-align:right}
+    .remForm{display:grid;grid-template-columns:160px 240px 1fr 110px;gap:16px;align-items:end;margin-top:24px}.field label{display:block;font-size:14px;font-weight:800;margin-bottom:12px;color:#fff}.field input{height:48px;border:0;border-radius:24px;background:#fff;color:#213044;padding:0 20px;font-weight:700;width:100%;font-family:inherit;font-size:14px;box-sizing:border-box}.addBtn{height:48px;border-radius:24px;background:transparent;color:#fff;font-weight:800;border:1px solid #fff;font-size:14px;transition:all .2s;cursor:pointer}.addBtn:hover{background:rgba(255,255,255,0.1)}.remList{margin-top:24px;display:grid;gap:12px}.remItem{min-height:78px;border-radius:16px;background:#fff;color:#172435;display:flex;align-items:center;justify-content:space-between;padding:16px 20px;font-weight:800;transition:opacity .2s,transform .2s}.remItem.off{opacity:.58}.remToggle{width:42px;height:24px;border-radius:12px;background:#cbd5e1;padding:3px;display:flex;align-items:center;transition:background .2s}.remToggle:before{content:"";width:18px;height:18px;border-radius:50%;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.25);transition:transform .2s}.remToggle.on{background:#0b8fe8}.remToggle.on:before{transform:translateX(18px)}.remMeta{display:flex;gap:7px;align-items:center;color:#6b8296;font-size:11px;font-weight:800}.remSync{display:inline-flex;align-items:center;min-height:32px;margin:18px 0 0 12px;color:#b9d4e3;font-size:13px;font-weight:800}
     .aiLayout{display:grid;grid-template-columns:1fr 1fr;gap:22px}.chatBox{height:220px;border-radius:16px;background:#fff;color:#172435;padding:14px;overflow:auto}.chatInput{display:flex;gap:10px;margin-top:12px}.chatInput input{height:45px;border:0;border-radius:12px;background:#fff;color:#172435;padding:0 14px;font-weight:800}.chatInput button,.primary{border-radius:12px;background:#075984;color:#fff;padding:0 18px;font-weight:900}
     .statusLine{margin-top:22px;font-weight:700;color:var(--muted);text-align:center}
     .drawLayout{display:flex;flex-direction:column;gap:20px;align-items:center}
@@ -1642,64 +1924,69 @@ function controlPageHtml() {
     .drawTools{display:grid;grid-template-columns:1fr 1fr;gap:12px;width:100%}
     @media(max-width:760px){body{padding:16px 12px}.statusCard,.tabPanel{padding:20px}.metricGrid{grid-template-columns:repeat(3,1fr);gap:8px}.metric{height:80px}.metric svg{width:20px;height:20px;margin-bottom:4px}.metric strong{font-size:18px}.metric span{font-size:11px}.gridExpr,.gridAnim{grid-template-columns:repeat(2,1fr);gap:12px}.aiLayout{grid-template-columns:1fr;gap:12px}.remForm{grid-template-columns:1fr}.tabs{display:flex;overflow-x:auto;height:48px;padding:4px;scroll-snap-type:x mandatory;-webkit-overflow-scrolling:touch;scrollbar-width:none;border-radius:16px;margin-bottom:16px}.tabs::-webkit-scrollbar{display:none}.tab{flex:0 0 auto;padding:0 16px;scroll-snap-align:start;font-size:13px;border-radius:12px}.oled{height:100px;margin-bottom:16px}.faceText{font-size:40px}.exprBtn{height:80px}.exprBtn .big{font-size:24px}.exprBtn small{font-size:11px}}
   </style></head><body><div class="app"><header class="top"><div class="brandMark"><div class="botIcon"><span class="ant l"></span><span class="ant r"></span><span class="halo"></span><div class="botHead"><span class="botEye l"></span><span class="botEye r"></span></div></div><div class="brandText"><strong>GemBot</strong><span>Mini AI Companion</span></div></div><div><span id="connBadge" class="pill"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:6px"><path d="M5 12.55a11 11 0 0 1 14.08 0M1.42 9a16 16 0 0 1 21.16 0M8.53 16.11a6 6 0 0 1 6.95 0M12 20h.01"/></svg> Terhubung</span><button id="logoutBtn" class="logout">Logout <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-left:4px"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></svg></button></div></header>
-    <section class="statusCard"><h1 class="title">Status Robot</h1><p class="subtitle">Telemetri realtime dari ESP32-C3</p><div class="oled"><div id="faceText" class="faceText">⌒‿⌒</div></div><div class="batteryRow"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="16" height="10" rx="2" ry="2"/><line x1="22" y1="11" x2="22" y2="13"/></svg> Baterai <div class="bar"><span></span></div>89%</div><div class="metricGrid"><div class="metric"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0z"/></svg><strong id="valTemp">26C</strong><span>Suhu</span></div><div class="metric"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2.69l5.66 5.66a8 8 0 1 1-11.31 0z"/></svg><strong id="valHum">58%</strong><span>Lembab</span></div><div class="metric"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg><strong id="valShake">0.0</strong><span>Gerakan</span></div></div></section>
+    <section class="statusCard"><h1 class="title">Status Robot</h1><p class="subtitle">Kondisi GemBot saat ini</p><div class="oled"><div id="faceText" class="faceText">⌒‿⌒</div></div><div class="batteryRow"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="16" height="10" rx="2" ry="2"/><line x1="22" y1="11" x2="22" y2="13"/></svg> Baterai <div class="bar"><span></span></div>89%</div><div class="metricGrid"><div class="metric"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0z"/></svg><strong id="valTemp">26C</strong><span>Suhu</span></div><div class="metric"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2.69l5.66 5.66a8 8 0 1 1-11.31 0z"/></svg><strong id="valHum">58%</strong><span>Lembab</span></div><div class="metric"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg><strong id="valShake">0.0</strong><span>Gerakan</span></div></div><div class="liveTranscriptBox" style="margin-top:16px;padding:12px;background:rgba(255,255,255,0.05);border-radius:12px;border:1px solid rgba(255,255,255,0.1)"><div style="font-size:11px;font-weight:800;color:#8ba3b8;margin-bottom:6px;letter-spacing:1px">LIVE TRANSCRIPT (STT)</div><div id="dashTranscript" style="font-size:14px;color:#fff;font-weight:600;min-height:20px;font-style:italic">Menunggu suara...</div></div></section>
     <nav class="tabs"><button class="tab active" data-tab="expr"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2M9 9h.01M15 9h.01"/></svg> Ekspresi</button><button class="tab" data-tab="music"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg> Musik</button><button class="tab" data-tab="rem"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9M13.73 21a2 2 0 0 1-3.46 0"/></svg> Pengingat</button><button class="tab" data-tab="ai"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="12" cy="5" r="2"/><path d="M12 7v4M8 16h.01M16 16h.01"/></svg> AI</button><button class="tab" data-tab="draw"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 19l7-7 3 3-7 7-3-3z"/><path d="M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z"/><path d="M2 2l7.586 7.586"/><circle cx="11" cy="11" r="2"/></svg> Draw</button><button class="tab" data-tab="sys"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg> Sistem</button></nav>
-    <section class="tabPanel"><div id="pane-expr" class="pane active"><h2 class="title">Kontrol Ekspresi</h2><p class="subtitle">Tampilkan ekspresi pada layar OLED</p><div class="gridExpr"><button class="exprBtn" data-cmd="M0"><span class="big">●‿●</span><small>Senyum</small></button><button class="exprBtn" data-cmd="M1"><span class="big">●⌣●</span><small>Senang</small></button><button class="exprBtn" data-cmd="M6"><span class="big">●︵●</span><small>Sedih</small></button><button class="exprBtn" data-cmd="M3"><span class="big">●_●</span><small>Marah</small></button><button class="exprBtn" data-cmd="M4"><span class="big">O_O</span><small>Kaget</small></button><button class="exprBtn" data-cmd="M5"><span class="big">•_•</span><small>Ngantuk</small></button><button class="exprBtn" data-cmd="M24"><span class="big">●▽●</span><small>Delight</small></button><button class="exprBtn" data-cmd="M25"><span class="big">●﹏●</span><small>Guilty</small></button><button class="exprBtn" data-cmd="M26"><span class="big">●⌒●</span><small>Daydream</small></button><button class="exprBtn" data-cmd="M27"><span class="big">●︿●</span><small>Grumpy</small></button><button class="exprBtn" data-cmd="M28"><span class="big">O▽O</span><small>Amazed</small></button><button class="exprBtn" data-cmd="M29"><span class="big">●︵●</span><small>Nangis</small></button><button class="exprBtn" data-cmd="M30"><span class="big">@_@</span><small>Pusing</small></button><button class="exprBtn" data-cmd="M31"><span class="big">●_−</span><small>Nakal</small></button></div></div>
-      <div id="pane-sys" class="pane"><h2 class="title">Sistem & Hardware</h2><p class="subtitle">Kontrol menu, ketukan, dan fungsi ESP32.</p><div class="gridExpr"><button class="exprBtn" data-cmd="P"><span class="big">TAP</span><small>Buka Menu/Next</small></button><button class="exprBtn" data-cmd="O"><span class="big">HOLD</span><small>Pilih/OK</small></button><button class="exprBtn" data-cmd="C"><span class="big">BACK</span><small>Balik Ekspresi</small></button><button class="exprBtn" data-cmd="G"><span class="big">GAME</span><small>Main Pingpong</small></button><button class="exprBtn" data-cmd="D"><span class="big">HAHA</span><small>Ketuk Ganda</small></button><button class="exprBtn" data-cmd="E"><span class="big">LOVE</span><small>Elus Owi</small></button><button class="exprBtn" data-cmd="F"><span class="big">FLIP</span><small>Balik Layar</small></button></div></div>
-      <div id="pane-music" class="pane"><h2 class="title">Kontrol Musik</h2><p class="subtitle">Jalankan animasi gerakan robot.</p><div class="musicNow"><span>Sedang diputar</span><strong id="songTitle">Love Story</strong><small>Taylor Swift</small></div><div class="musicControls"><button id="btnPrevSong" class="circle"><svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M11 5L4 12l7 7V5z"/><path d="M19 5l-7 7 7 7V5z"/></svg></button><button id="btnPlaySong" class="circle main"><svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z"/></svg></button><button id="btnStopAudio" class="circle"><svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M13 5l7 7-7 7V5z"/><path d="M5 5l7 7-7 7V5z"/></svg></button></div><div class="volRow"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/></svg><input id="volLoveStory" class="volSlider" type="range" min="4" max="55" value="40"><span>40</span></div><div class="musicControls" style="margin:0 0 28px"><button id="btnMusicTestMax" class="animBtn" style="max-width:220px;margin:0 auto">Test MAX</button></div><div class="plHeader"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="3"/></svg> PLAYLIST</div><div class="playlist"><div class="song" data-file="mbg.mp3"><span>1</span><strong>MBG</strong><small>MBG Anthem 2:40</small></div><div class="song" data-file="hai_owi.wav"><span>2</span><strong>Save Your Tears</strong><small>The Weeknd 2:04</small></div><div class="song active" data-file="lovestory.mp3"><span>3</span><strong>Love Story</strong><small>Taylor Swift 3:01</small></div><div class="song" data-file="DFP"><span>4</span><strong>Tarot</strong><small>Hindia 3:05</small></div><div class="song" data-file="DFP2"><span>5</span><strong>Kasih Aba-aba</strong><small>Tenxi, Naykilla 3:09</small></div></div></div>
-      <div id="pane-rem" class="pane"><h2 class="title">Alarm dan Pengingat</h2><p class="subtitle">Atur waktu alarm; robot akan memutar file alarm.</p><div class="remForm"><div class="field"><label>Jam</label><input id="remTime" type="time"></div><div class="field"><label>Tanggal</label><input id="remDate" type="date"></div><div class="field"><label>Keterangan</label><input id="remText" placeholder="Masukkan keterangan pengingat"></div><button id="addReminder" class="addBtn">+Tambah</button></div><div id="reminderList" class="remList"></div><button id="sendReminder" class="primary" style="height:44px;margin-top:18px">Sync ke Owi</button></div>
-      <div id="pane-draw" class="pane"><h2 class="title">Draw TFT</h2><p class="subtitle">Gambar langsung di canvas 240x320, hasilnya live sync ke layar Owi.</p><div class="drawLayout"><canvas id="drawCanvas" class="drawCanvas" width="240" height="320"></canvas><div class="drawTools"><button id="enterDraw" class="primary" style="height:46px">Masuk Draw Mode</button><button id="clearDraw" class="primary" style="height:46px">Clear Canvas</button><div style="grid-column:1/-1;text-align:center"><p id="drawSyncState" class="statusLine" style="margin-top:0">Live draw siap</p><p class="subtitle" style="margin:0">Klik dan drag di area hitam. Setiap goresan otomatis dikirim ke TFT tanpa tombol kirim.</p></div></div></div></div>
-      <div id="pane-ai" class="pane"><h2 class="title">AI Assistant</h2><p class="subtitle">Chatbot, suara bot, dan monitoring INMP.</p><div class="aiLayout"><div><div id="aiLimitBadge" class="pill" style="background:rgba(255,255,255,0.1);color:#fff">AI: --</div> <div id="aiKeyBadge" class="pill" style="background:rgba(255,255,255,0.1);color:#fff">KEY: --</div><div id="chatHistory" class="chatBox" style="height:220px;margin-top:12px;margin-bottom:12px"></div><div class="chatInput"><input id="chatInput" placeholder="Tanya Owi..."><button id="sendChatBtn">Kirim</button></div><label style="display:block;margin-top:10px;font-weight:900;color:#fff"><input id="chatSpeak" type="checkbox" checked> Suara Bot</label><input id="chatVoiceVol" type="range" min="8" max="42" value="24" style="width:100%;margin-top:12px"></div><div><p id="speechLive" class="statusLine" style="color:#fff;margin-top:0;text-align:left">INMP: <span id="inmpLevelText">0%</span> • <span id="speechStatus">IDLE</span></p><div class="chatBox" style="height:96px;margin-bottom:12px"><strong>Yang terdengar</strong><div id="heardText" style="margin-top:10px;font-size:18px;color:#172435;font-weight:900">Belum ada suara</div></div><div id="speechLog" class="chatBox" style="height:160px;margin-bottom:12px"></div><button id="startSpeech" class="primary">Mulai Dengar Web</button> <button id="stopSpeech" class="primary">Stop</button></div></div></div></section><div id="status" class="statusLine">System ready</div></div>${floatingChatbotHtml()}
+    <section class="tabPanel"><div id="pane-expr" class="pane active"><h2 class="title">Kontrol Ekspresi</h2><p class="subtitle">Pilih mood GemBot secara langsung.</p><div class="gridExpr"><button class="exprBtn" data-cmd="M0"><span class="big">●‿●</span><small>Senyum</small></button><button class="exprBtn" data-cmd="M1"><span class="big">⌒▽⌒</span><small>Senang</small></button><button class="exprBtn" data-cmd="M6"><span class="big">●︵●</span><small>Sedih</small></button><button class="exprBtn" data-cmd="M3"><span class="big">◣︵◢</span><small>Marah</small></button><button class="exprBtn" data-cmd="M4"><span class="big">OｏO</span><small>Kaget</small></button><button class="exprBtn" data-cmd="M5"><span class="big">—‿—</span><small>Ngantuk</small></button><button class="exprBtn" data-cmd="M24"><span class="big">⌒▽⌒</span><small>Delight</small></button><button class="exprBtn" data-cmd="M25"><span class="big">●﹏●</span><small>Guilty</small></button><button class="exprBtn" data-cmd="M26"><span class="big">◔‿◔</span><small>Daydream</small></button><button class="exprBtn" data-cmd="M27"><span class="big">¬︵¬</span><small>Grumpy</small></button><button class="exprBtn" data-cmd="M28"><span class="big">O▽O</span><small>Amazed</small></button><button class="exprBtn" data-cmd="M29"><span class="big">╥︵╥</span><small>Nangis</small></button><button class="exprBtn" data-cmd="M30"><span class="big">@﹏@</span><small>Pusing</small></button><button class="exprBtn" data-cmd="M31"><span class="big">—‿●</span><small>Nakal</small></button><button class="exprBtn" data-cmd="M50"><span class="big">♥‿♥</span><small>Love</small></button><button class="exprBtn" data-cmd="M51"><span class="big">＞▽＜</span><small>Ketawa</small></button></div></div>
+      <div id="pane-sys" class="pane"><h2 class="title">Kontrol Cepat</h2><p class="subtitle">Buka menu, pilih, kembali, atau mulai game dari web.</p><div class="gridExpr"><button class="exprBtn" data-cmd="P"><span class="big">TAP</span><small>Buka Menu/Next</small></button><button class="exprBtn" data-cmd="O"><span class="big">HOLD</span><small>Pilih/OK</small></button><button class="exprBtn" data-cmd="C"><span class="big">BACK</span><small>Balik Ekspresi</small></button><button class="exprBtn" data-cmd="G"><span class="big">GAME</span><small>Main Pingpong</small></button><button class="exprBtn" data-cmd="F"><span class="big">FLIP</span><small>Balik Layar</small></button></div><div class="volRow" style="margin-top:24px;background:#11486d;padding:16px 20px;border-radius:16px;border:1px solid rgba(255,255,255,0.1);align-items:center"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/></svg><div style="flex:1"><div style="font-size:11px;font-weight:800;color:#8ba3b8;margin-bottom:8px;letter-spacing:1px">VOLUME SUARA ROBOT (ESP32)</div><div style="display:flex;align-items:center;gap:12px"><input id="volRobot" class="volSlider" type="range" min="0" max="24" value="20"><span id="volRobotVal" style="font-weight:900;font-size:15px;min-width:24px;text-align:right">20</span></div></div></div></div>
+      <div id="pane-music" class="pane"><h2 class="title">Kontrol Musik</h2><p class="subtitle">Jalankan lagu dari DFPlayer Mini.</p><div class="musicNow"><span>Sedang diputar</span><strong id="songTitle">Love Story</strong><small id="songArtist">Taylor Swift - 3:54</small></div><div class="musicControls"><button id="btnPrevSong" class="circle" title="Sebelumnya"><svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M11 5L4 12l7 7V5z"/><path d="M19 5l-7 7 7 7V5z"/></svg></button><button id="btnPlaySong" class="circle main" title="Play/Pause"><svg id="playIcon" width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg></button><button id="btnNextSong" class="circle" title="Berikutnya"><svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M13 5l7 7-7 7V5z"/><path d="M5 5l7 7-7 7V5z"/></svg></button><button id="btnStopAudio" class="circle" title="Stop"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg></button></div><div class="volRow"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/></svg><input id="volLoveStory" class="volSlider" type="range" min="4" max="55" value="40"><span>40</span></div><div class="musicControls" style="margin:0 0 28px"><button id="btnMusicTestMax" class="animBtn" style="max-width:220px;margin:0 auto">Test MAX</button></div><div class="plHeader"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="3"/></svg> PLAYLIST DFPLAYER</div><div class="playlist"><div class="song active" data-file="DFP:1"><span>1</span><strong>Love Story</strong><small>Taylor Swift 3:54</small></div><div class="song" data-file="DFP:2"><span>2</span><strong>MBG</strong><small>Local MP3 0:15</small></div><div class="song" data-file="DFP:3"><span>3</span><strong>YELLOW</strong><small>Coldplay 4:29</small></div><div class="song" data-file="DFP:4"><span>4</span><strong>REDRED</strong><small>CORTIS 2:43</small></div></div></div>
+      <div id="pane-rem" class="pane"><h2 class="title">Alarm dan Pengingat</h2><p class="subtitle">Tambah jadwal, aktifkan yang diperlukan, lalu sinkronkan ke GemBot.</p><div class="remForm"><div class="field"><label>Jam</label><input id="remTime" type="time"></div><div class="field"><label>Tanggal</label><input id="remDate" type="date"></div><div class="field"><label>Keterangan</label><input id="remText" maxlength="32" placeholder="Masukkan keterangan pengingat"></div><button id="addReminder" class="addBtn">+ Tambah</button></div><div id="reminderList" class="remList"></div><button id="sendReminder" class="primary" style="height:44px;margin-top:18px">Sync ke GemBot</button><span id="remSyncState" class="remSync">Belum ada perubahan yang dikirim</span></div>
+      <div id="pane-draw" class="pane"><h2 class="title">Kanvas Gambar</h2><div class="drawLayout"><canvas id="tftCanvas" class="drawCanvas" width="240" height="320"></canvas><div class="drawTools"><button id="enterDraw" class="primary" style="height:46px">Masuk Draw Mode</button><button id="clearDraw" class="primary" style="height:46px">Clear Canvas</button>
+<div style="grid-column:1/-1; display:flex; gap:10px; margin-top:10px;">
+  <label style="flex:1;font-family:'Roboto Mono',monospace;font-size:0.75rem;font-weight:800;color:var(--text-light)">BRUSH
+    <input type="range" id="tftBrushSize" min="1" max="15" value="3" style="width:100%;margin-top:0.4rem;">
+  </label>
+  <label style="flex:1;font-family:'Roboto Mono',monospace;font-size:0.75rem;font-weight:800;color:var(--text-light)">WARNA
+    <input type="color" id="tftDrawColor" value="#ffffff" style="width:100%;height:24px;border:none;padding:0;cursor:pointer;margin-top:0.2rem;border-radius:4px;">
+  </label>
+  <label style="flex:1;font-family:'Roboto Mono',monospace;font-size:0.75rem;font-weight:800;color:var(--text-light)">BG CANVAS
+    <input type="color" id="tftCanvasColor" value="#000000" style="width:100%;height:24px;border:none;padding:0;cursor:pointer;margin-top:0.2rem;border-radius:4px;">
+  </label>
+</div>
+<div style="grid-column:1/-1;text-align:center"><p id="drawSyncState" class="statusLine" style="margin-top:0">Live draw siap</p></div></div></div></div>
+      <div id="pane-ai" class="pane"><h2 class="title">Teman Bicara</h2><p class="subtitle">Tanya atau ajak GemBot ngobrol.</p><div class="aiLayout"><div><div id="aiLimitBadge" class="pill" style="background:rgba(255,255,255,0.1);color:#fff">AI: --</div> <div id="aiKeyBadge" class="pill" style="display:none">KEY: --</div><div id="chatHistory" class="chatBox" style="height:220px;margin-top:12px;margin-bottom:12px"></div><div class="chatInput"><input id="chatInput" placeholder="Tanya GemBot..."><button id="sendChatBtn">Kirim</button></div><label style="display:block;margin-top:10px;font-weight:900;color:#fff"><input id="chatSpeak" type="checkbox" checked> Suara GemBot</label><input id="chatVoiceVol" type="range" min="20" max="85" value="72" style="width:100%;margin-top:12px"></div><div><p id="speechLive" class="statusLine" style="color:#fff;margin-top:0;text-align:left">Suara: <span id="inmpLevelText">0%</span> • <span id="speechStatus">SIAP</span></p><div class="chatBox" style="height:96px;margin-bottom:12px"><strong>Yang terdengar</strong><div id="heardText" style="margin-top:10px;font-size:18px;color:#172435;font-weight:900">Belum ada suara</div></div><div id="speechLog" class="chatBox" style="height:160px;margin-bottom:12px"></div><button id="startSpeech" class="primary">Dengarkan</button> <button id="stopSpeech" class="primary">Kirim Suara</button></div></div></div></section><div id="status" class="statusLine">System ready</div></div>${floatingChatbotHtml()}
   <script>
     if(!localStorage.getItem('owi_current_user')) location.href='/';
-    const $=id=>document.getElementById(id);let currentFile='lovestory.mp3';let reminders=[];let manualFaceUntil=0,manualFace='●‿●';const exprPreview={M0:['●‿●','Normal'],M1:['●⌣●','Senang'],M2:['●‿●','Love'],M3:['●_●','Marah'],M4:['O_O','Kaget'],M5:['•_•','Ngantuk'],M6:['●︵●','Sedih'],M7:['●▽●','Excited'],M8:['●_●','Smug'],M9:['•_•','Takut'],M10:['●⌣●','Cozy'],M11:['●~●','Woozy'],M12:['●⌒●','Cheeky'],M13:['●﹏●','Bashful'],M14:['●_●','Focus'],M15:['●_●','Bored'],M16:['●︿●','Nope'],M17:['●▽●','Party'],M18:['●⌣●','Relieved'],M19:['●_●','Suspicious'],M20:['●▽●','Giggle'],M21:['●_●','Determined'],M22:['O_O','Wow'],M23:['•﹏•','Melt'],M24:['●▽●','Delight'],M25:['●﹏●','Guilty'],M26:['●⌒●','Daydream'],M27:['●︿●','Grumpy'],M28:['O▽O','Amazed'],M29:['●︵●','Nangis']};function setStatus(t,bad){$('status').textContent=t;$('status').style.color=bad?'#ff9aac':'#d7e9f2'}function setLiveFace(face,label,ttl=6000){manualFace=face;manualFaceUntil=Date.now()+ttl;$('faceText').textContent=face;$('faceText').classList.remove('livePulse');void $('faceText').offsetWidth;$('faceText').classList.add('livePulse');setTimeout(()=>$('faceText').classList.remove('livePulse'),180)}
-    document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.pane').forEach(x=>x.classList.remove('active'));b.classList.add('active');$('pane-'+b.dataset.tab).classList.add('active')});
+    const $=id=>document.getElementById(id);let currentFile='DFP:1';let musicPaused=false;let reminders=[];let manualFaceUntil=0,manualFace='●‿●';let lastServerTranscript='';let lastServerReply='';const exprPreview={M0:['●‿●','Normal'],M1:['⌒▽⌒','Senang'],M2:['●♥●','Love'],M3:['◣︵◢','Marah'],M4:['OｏO','Kaget'],M5:['—‿—','Ngantuk'],M6:['●︵●','Sedih'],M7:['⌒▽⌒','Excited'],M8:['●⌣●','Smug'],M9:['•﹏•','Takut'],M10:['●‿●','Cozy'],M11:['@﹏@','Woozy'],M12:['●⌣●','Cheeky'],M13:['●﹏●','Bashful'],M14:['◉_◉','Focus'],M15:['¬_¬','Bored'],M16:['●︿●','Nope'],M17:['⌒▽⌒','Party'],M18:['●‿●','Relieved'],M19:['¬_●','Suspicious'],M20:['⌒▽⌒','Giggle'],M21:['◣_◢','Determined'],M22:['OｏO','Wow'],M23:['@﹏@','Melt'],M24:['⌒▽⌒','Delight'],M25:['●﹏●','Guilty'],M26:['◔‿◔','Daydream'],M27:['¬︵¬','Grumpy'],M28:['O▽O','Amazed'],M29:['╥︵╥','Nangis'],M30:['@﹏@','Pusing'],M31:['—‿●','Nakal'],M50:['♥‿♥','Love'],M51:['＞▽＜','Ketawa']};function setStatus(t,bad){$('status').textContent=t;$('status').style.color=bad?'#ff9aac':'#d7e9f2'}function setLiveFace(face,label,ttl=6000){manualFace=face;manualFaceUntil=Date.now()+ttl;$('faceText').textContent=face;$('faceText').classList.remove('livePulse');void $('faceText').offsetWidth;$('faceText').classList.add('livePulse');setTimeout(()=>$('faceText').classList.remove('livePulse'),180)}
+    document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.pane').forEach(x=>x.classList.remove('active'));b.classList.add('active');$('pane-'+b.dataset.tab).classList.add('active');if(b.dataset.tab==='draw')activateDrawMode(true)});
     document.querySelectorAll('[data-cmd]').forEach(b=>b.onclick=async()=>{const p=exprPreview[b.dataset.cmd];if(p)setLiveFace(p[0],p[1]);try{const r=await fetch('/cmd/'+b.dataset.cmd,{method:'POST'});setStatus(await r.text(),!r.ok)}catch(e){setStatus(e.message,true)}});
-    document.querySelectorAll('.song').forEach(s=>s.onclick=()=>{document.querySelectorAll('.song').forEach(x=>x.classList.remove('active'));s.classList.add('active');currentFile=s.dataset.file;$('songTitle').textContent=s.querySelector('strong').textContent});
-    async function playCurrent(){try{if(currentFile==='DFP'){const r=await fetch('/dfplayer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'PLAY',track:1,volume:22})});setStatus(await r.text(),!r.ok);return}const vol=($('volLoveStory').value/100).toFixed(2);const r=await fetch('/play_audio',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({file:currentFile,volume:vol})});setStatus(await r.text(),!r.ok)}catch(e){setStatus(e.message,true)}}
-    $('btnPlaySong').onclick=playCurrent;$('btnPrevSong').onclick=()=>{const songs=[...document.querySelectorAll('.song')];let i=songs.findIndex(x=>x.classList.contains('active'));songs[(i+songs.length-1)%songs.length].click();playCurrent()};$('btnStopAudio').onclick=async()=>{const r=await fetch('/stop_audio',{method:'POST'});setStatus(await r.text(),!r.ok)};
-    $('addReminder').onclick=()=>{const time=$('remTime').value||'23:47';const text=$('remText').value||'Tidur';const date=$('remDate').value?new Date($('remDate').value).toLocaleDateString('id-ID',{day:'2-digit',month:'short',year:'numeric'}):'08 Jun 2026';reminders.push({time,text,date});renderRem()};function renderRem(){$('reminderList').innerHTML=reminders.map((r,i)=>'<div class="remItem"><div style="display:flex;align-items:center;gap:16px"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#11486d" stroke-width="2"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9M13.73 21a2 2 0 0 1-3.46 0"/></svg><div style="line-height:1.2"><span style="font-size:16px;font-weight:900;color:#182336">'+r.time+'</span><br><span style="font-size:13px;color:#8ba3b8;font-weight:700">'+r.text+'</span></div></div><div style="display:flex;flex-direction:column;align-items:flex-end;gap:8px"><div style="display:flex;gap:12px;align-items:center"><div style="width:36px;height:20px;border-radius:10px;background:#e2e8f0;display:flex;align-items:center;padding:2px;box-sizing:border-box"><div style="width:16px;height:16px;border-radius:50%;background:#11486d;transform:translateX(16px)"></div></div><button data-del="'+i+'" style="background:none;border:none;color:#8ba3b8;cursor:pointer;padding:0"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2 2v2"/></svg></button></div><div style="display:inline-flex;align-items:center;gap:6px;border:1px solid #d1d5db;border-radius:12px;padding:4px 8px;font-size:10px;font-weight:800;color:#64748b"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg> '+r.date+'</div></div></div>').join('');document.querySelectorAll('[data-del]').forEach(b=>b.onclick=()=>{reminders.splice(+b.dataset.del,1);renderRem()})}
-    $('sendReminder').onclick=async()=>{const list=reminders.length?reminders:[{time:$('remTime').value||'07:30',text:$('remText').value||'enroll lagi ya deck'}];const r=await fetch('/reminder',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reminders:list})});setStatus(await r.text(),!r.ok)};
-    function appendChat(who,msg,mine){const d=document.createElement('div');d.style.cssText='margin:8px 0;padding:10px 12px;border-radius:12px;background:'+(mine?'#075984':'#eef6fb')+';color:'+(mine?'#fff':'#172435')+';font-weight:800';d.textContent=who+': '+msg;$('chatHistory').appendChild(d);$('chatHistory').scrollTop=99999}
-    $('sendChatBtn').onclick=async()=>{const msg=$('chatInput').value.trim();if(!msg)return;$('chatInput').value='';appendChat('Kamu',msg,true);try{const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg,speak:$('chatSpeak').checked,voiceVolume:($('chatVoiceVol').value/100).toFixed(2)})});const j=await r.json();if(j.error)appendChat('Error',j.error,false);else{appendChat('Owi',j.response,false);refreshAiLimit()}}catch(e){appendChat('Error',e.message,false)}};
-    $('chatInput').addEventListener('keydown',e=>{if(e.key==='Enter')$('sendChatBtn').click()});$('logoutBtn').onclick=()=>{localStorage.removeItem('owi_current_user');location.href='/'};
-    const c=$('drawCanvas'),ctx=c.getContext('2d',{willReadFrequently:true});ctx.fillStyle='#000';ctx.fillRect(0,0,240,320);ctx.strokeStyle='#fff';ctx.fillStyle='#fff';ctx.lineCap='round';let drawing=false,last=null,busy=false,pending=false;function pt(e){const r=c.getBoundingClientRect(),s=e.touches?.[0]||e;return{x:Math.max(0,Math.min(239,Math.floor((s.clientX-r.left)*240/r.width))),y:Math.max(0,Math.min(319,Math.floor((s.clientY-r.top)*320/r.height)))}}function draw(p){ctx.lineWidth=4;if(last){ctx.beginPath();ctx.moveTo(last.x,last.y);ctx.lineTo(p.x,p.y);ctx.stroke()}ctx.beginPath();ctx.arc(p.x,p.y,2,0,7);ctx.fill();last=p;syncSoon()}function down(e){e.preventDefault();drawing=true;last=null;draw(pt(e))}function move(e){if(!drawing)return;e.preventDefault();draw(pt(e))}function up(){drawing=false;last=null}c.onpointerdown=down;c.onpointermove=move;window.onpointerup=up;
-    async function enterDraw(){await fetch('/cmd/W',{method:'POST'})}function bytes(){const img=ctx.getImageData(0,0,240,320).data,out=new Uint8Array(9600);for(let y=0;y<320;y++)for(let xb=0;xb<30;xb++){let v=0;for(let bit=0;bit<8;bit++){const x=xb*8+bit,i=(y*240+x)*4;if(img[i]+img[i+1]+img[i+2]>384)v|=128>>bit}out[y*30+xb]=v}return out}async function sync(){if(busy)return pending=true;busy=true;pending=false;try{await enterDraw();await fetch('/frame',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:bytes()});setStatus('Draw tersinkron')}catch(e){setStatus(e.message,true)}busy=false;if(pending)syncSoon()}function syncSoon(){clearTimeout(window._ds);window._ds=setTimeout(sync,140)}$('enterDraw').onclick=sync;$('clearDraw').onclick=()=>{ctx.fillStyle='#000';ctx.fillRect(0,0,240,320);sync();fetch('/cmd/W',{method:'POST'})};
-    async function testMax(){const r=await fetch('/test_max',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({volume:($('volLoveStory').value/100).toFixed(2)})});setStatus(await r.text(),!r.ok)}
-    if ($('btnTestMax')) $('btnTestMax').onclick=testMax;
-    if ($('btnMusicTestMax')) $('btnMusicTestMax').onclick=testMax;
-    async function refreshSensors(){try{const r=await fetch('/api/sensors');const s=await r.json();if(!s.connected){$('connBadge').innerHTML='<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:6px;vertical-align:-2px"><path d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4"/></svg> '+(s.socketOpen?'Telemetri lambat':'Terputus');$('connBadge').style.background='#8e2940';$('connBadge').style.borderColor='#8e2940';return}$('connBadge').innerHTML='<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:6px;vertical-align:-2px"><path d="M5 12.55a11 11 0 0 1 14.08 0M1.42 9a16 16 0 0 1 21.16 0M8.53 16.11a6 6 0 0 1 6.95 0M12 20h.01"/></svg> Terhubung';$('connBadge').style.background='rgba(16,95,145,.8)';$('connBadge').style.borderColor='transparent';$('valTemp').textContent=(s.temp&&s.temp>-90)?Math.round(s.temp)+'C':'--';$('valHum').textContent=(s.hum&&s.hum>=0)?Math.round(s.hum)+'%':'--';$('valShake').textContent=Number(s.shakeMeter||0).toFixed(1);$('inmpLevelText').textContent=(s.inmp||0)+'%';if(s.voiceStatus)$('speechStatus').textContent=String(s.voiceStatus).toUpperCase();if(s.voiceTranscript&&s.voiceTranscript!==lastServerTranscript){lastServerTranscript=s.voiceTranscript;setHeardText(s.voiceTranscript,false);$('speechLive').textContent='BOT: '+s.voiceTranscript;addSpeechLine(s.voiceTranscript,'BOT')}let face='●‿●';if(s.angry)face='●_●';else if(s.love)face='●⌣●';else if(s.sleep)face='•_•';else if(s.surprised)face='O_O';else if(s.dizzy||s.woozy)face='●~●';const sensorActive=s.angry||s.love||s.sleep||s.surprised||s.dizzy||s.woozy;if(sensorActive||Date.now()>manualFaceUntil)$('faceText').textContent=face}catch(e){$('connBadge').innerHTML='<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:6px;vertical-align:-2px"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg> Server error';$('connBadge').style.background='#8e2940';$('connBadge').style.borderColor='#8e2940'}}setInterval(refreshSensors,500);refreshSensors();
-    async function refreshAiLimit(){try{const r=await fetch('/api/ai-limit');const s=await r.json();$('aiLimitBadge').textContent='AI '+s.used+'/'+s.limit+' sisa '+s.remaining;$('aiKeyBadge').textContent=s.enabled?'KEY siap':'KEY belum'}catch{}}refreshAiLimit();setInterval(refreshAiLimit,5000);
-    let rec=null,listening=false,lastServerTranscript='';function addSpeechLine(text,tag='WEB'){if(!text)return;const line=document.createElement('div');line.style.cssText='margin:6px 0;padding:8px 10px;border-radius:10px;background:#eef6fb;color:#172435;font-weight:900';line.textContent=tag+': '+text;$('speechLog').prepend(line)}function setHeardText(text,interim=false){$('heardText').textContent=text||'Belum ada suara';$('heardText').style.opacity=interim?.65:1;$('heardText').style.color=interim?'#52677a':'#172435'}function initSpeech(){const SR=window.SpeechRecognition||window.webkitSpeechRecognition;if(!SR){$('speechStatus').textContent='Browser tidak dukung';return null}const r=new SR();r.lang='id-ID';r.continuous=true;r.interimResults=true;r.onstart=()=>{$('speechStatus').textContent='MENDENGAR'};r.onend=()=>{if(listening)try{r.start()}catch{}else $('speechStatus').textContent='IDLE'};r.onresult=e=>{let interim='';for(let i=e.resultIndex;i<e.results.length;i++){const t=e.results[i][0].transcript.trim();if(e.results[i].isFinal){setHeardText(t,false);$('speechLive').textContent='WEB: '+t;$('chatInput').value=t;$('sendChatBtn').click();addSpeechLine(t,'WEB')}else interim+=t+' '}if(interim.trim()){setHeardText(interim.trim(),true);$('speechLive').textContent='WEB: '+interim.trim()}};return r}$('startSpeech').onclick=()=>{rec=rec||initSpeech();listening=true;try{rec.start()}catch{}};$('stopSpeech').onclick=()=>{listening=false;if(rec)rec.stop()};
-    ${floatingChatbotJs()}
-  </script></body></html>`;
-}
+    document.querySelectorAll('.song').forEach(s=>s.onclick=()=>{document.querySelectorAll('.song').forEach(x=>x.classList.remove('active'));s.classList.add('active');currentFile=s.dataset.file;$('songTitle').textContent=s.querySelector('strong').textContent;if($('songArtist'))$('songArtist').textContent=s.querySelector('small').textContent});
+    function dfVol(){return Math.max(0,Math.min(30,Math.round(Number($('volLoveStory').value||40)*30/100)))}
+    function currentTrack(){return currentFile.startsWith('DFP:')?Number(currentFile.split(':')[1]||1):1}
+    function setPlayIcon(mode){const icon=$('playIcon');if(!icon)return;icon.innerHTML=(mode==='pause')?'<path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z"/>':'<path d="M8 5v14l11-7z"/>'}
+    async function dfCommand(action,track=currentTrack()){const r=await fetch('/dfplayer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,track,volume:dfVol()})});setStatus(await r.text(),!r.ok);return r.ok}
+    async function playCurrent(){try{if(currentFile.startsWith('DFP:')){await dfCommand('VOL');const ok=await dfCommand('PLAY',currentTrack());musicPaused=false;setPlayIcon('pause');return ok}const vol=($('volLoveStory').value/100).toFixed(2);const r=await fetch('/play_audio',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({file:currentFile,volume:vol})});setStatus(await r.text(),!r.ok);setPlayIcon('pause')}catch(e){setStatus(e.message,true)}}
+    $('btnPlaySong').onclick=async()=>{if(currentFile.startsWith('DFP:')){try{if($('playIcon')?.innerHTML.includes('M6 4')){const ok=await dfCommand('PAUSE');if(ok){musicPaused=true;setPlayIcon('play')}}else if(musicPaused){const ok=await dfCommand('RESUME');if(ok){musicPaused=false;setPlayIcon('pause')}}else await playCurrent()}catch(e){setStatus(e.message,true)}}else await playCurrent()};
+    $('btnPrevSong').onclick=()=>{const songs=[...document.querySelectorAll('.song')];let i=songs.findIndex(x=>x.classList.contains('active'));songs[(i+songs.length-1)%songs.length].click();playCurrent()};
+    $('btnNextSong').onclick=()=>{const songs=[...document.querySelectorAll('.song')];let i=songs.findIndex(x=>x.classList.contains('active'));songs[(i+1)%songs.length].click();playCurrent()};
+    $('btnStopAudio').onclick=async()=>{try{let r;if(currentFile.startsWith('DFP:')){r=await fetch('/dfplayer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'STOP'})})}else{r=await fetch('/stop_audio',{method:'POST'})}setStatus(await r.text(),!r.ok);musicPaused=false;setPlayIcon('play')}catch(e){setStatus(e.message,true)}};
+    let volTimer=null;$('volLoveStory').oninput=()=>{$('volLoveStory').nextElementSibling.textContent=$('volLoveStory').value;if(currentFile.startsWith('DFP:')){clearTimeout(volTimer);volTimer=setTimeout(()=>dfCommand('VOL'),180)}};
+    $('volRobot').addEventListener('input', ev => $('volRobotVal').textContent = ev.target.value);
+    $('volRobot').addEventListener('change', async ev => { try { await fetch('/api/volume', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({val: ev.target.value}) }); setStatus('Volume robot diubah ke ' + ev.target.value); } catch(e) { setStatus(e.message, true); } });
+    const reminderKey='gembot_reminders';
+    const escapeReminder=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    const reminderDateLabel=date=>date?new Date(date+'T00:00:00').toLocaleDateString('id-ID',{day:'2-digit',month:'short',year:'numeric'}):'Setiap hari';
+    function saveReminderDraft(){localStorage.setItem(reminderKey,JSON.stringify(reminders))}
+    function renderRem(){
+      $('reminderList').innerHTML=reminders.map((r,i)=>'<div class="remItem '+(r.active===false?'off':'')+'"><div style="display:flex;align-items:center;gap:16px"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#11486d" stroke-width="2"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9M13.73 21a2 2 0 0 1-3.46 0"/></svg><div style="line-height:1.25"><span style="font-size:17px;font-weight:900;color:#182336">'+escapeReminder(r.time)+'</span><br><span style="font-size:13px;color:#597086;font-weight:800">'+escapeReminder(r.text)+'</span><div class="remMeta">'+escapeReminder(reminderDateLabel(r.date))+' · '+(r.active===false?'Nonaktif':'Aktif')+'</div></div></div><div style="display:flex;gap:12px;align-items:center"><button type="button" aria-label="Aktifkan pengingat" data-toggle="'+i+'" class="remToggle '+(r.active===false?'':'on')+'"></button><button type="button" aria-label="Hapus pengingat" data-del="'+i+'" style="background:none;border:none;color:#8ba3b8;cursor:pointer;padding:6px"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2 2v2"/></svg></button></div></div>').join('');
+      document.querySelectorAll('[data-del]').forEach(b=>b.onclick=()=>{reminders.splice(+b.dataset.del,1);saveReminderDraft();renderRem();$('remSyncState').textContent='Perubahan belum disinkronkan'});
+    return;
+  }
 
-const server = http.createServer((req, res) => {
-  if (req.method === "GET" && req.url === "/") {
-    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store, no-cache, must-revalidate" });
-    res.end(pageHtml());
-    return;
-  }
-  if (req.method === "GET" && req.url === "/control") {
-    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store, no-cache, must-revalidate" });
-    res.end(controlPageHtml());
-    return;
-  }
-  if (req.method === "GET" && req.url === "/logs") {
-    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" });
-    res.end(logs.join("\\n"));
-    return;
-  }
-  if (req.method === "GET" && req.url === "/api/sensors") {
-    const health = getOwiHealth();
-    res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
-    res.end(JSON.stringify({ ...latestTelemetry, ...health, ...latestSpeech }));
-    return;
-  }
-  if (req.method === "GET" && req.url === "/api/ai-limit") {
-    res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
-    res.end(JSON.stringify(getAiLimitStatus()));
+  if (req.method === "POST" && req.url === "/api/volume") {
+    let body = "";
+    req.on("data", chunk => body += chunk);
+    req.on("end", () => {
+      try {
+        const data = JSON.parse(body);
+        if (data.val !== undefined && owiSocket && owiSocket.readyState === WebSocket.OPEN) {
+            owiSocket.send("CMD:VOL:" + parseInt(data.val));
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: true }));
+      } catch(e) {
+        res.writeHead(500); res.end(JSON.stringify({error: e.message}));
+      }
+    });
     return;
   }
   
@@ -1736,7 +2023,52 @@ const server = http.createServer((req, res) => {
         const data = JSON.parse(Buffer.concat(chunks).toString() || "{}");
         const userMsg = sanitizeOledText(data.message || "Halo");
         const speak = data.speak !== false;
-        const voiceVolume = clampVolume(data.voiceVolume, 0.24).toFixed(2);
+        const voiceVolume = clampVolume(data.voiceVolume, 0.85).toFixed(2);
+        const dhtReply = parseDhtIntent(userMsg);
+        if (dhtReply) {
+          let oledSent = true;
+          let oledError = "";
+          try {
+            await sendChatText(dhtReply);
+          } catch (serialErr) {
+            oledSent = false;
+            oledError = serialErr.message;
+            logEvent(`chat oled err: ${oledError}`);
+          }
+          let speechSent = false;
+          let speechError = "";
+          if (speak) {
+            try {
+              await speakReplyOnBot(dhtReply, voiceVolume);
+              speechSent = true;
+            } catch (speechErr) {
+              speechError = speechErr.message;
+              logEvent(`chat tts err: ${speechError}`);
+            }
+          }
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ response: dhtReply, provider: "LocalSensor", model: "DHT22", oledSent, oledError, speechSent, speechError, ai: getAiLimitStatus() }));
+          return;
+        }
+        const musicIntent = parseDfMusicIntent(userMsg);
+        if (musicIntent) {
+          const reply = await executeDfMusicIntent(musicIntent, Math.round(Number(voiceVolume) * 30));
+          let oledSent = true;
+          let oledError = "";
+          try {
+            await sendChatText(reply);
+          } catch (serialErr) {
+            oledSent = false;
+            oledError = serialErr.message;
+            logEvent(`chat oled err: ${oledError}`);
+          }
+          let speechSent = false;
+          let speechError = "";
+          if (speak) speechError = "Musik langsung tampil di layar, suara balasan dilewati.";
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ response: reply, provider: "LocalCommand", model: "DFPlayer", oledSent, oledError, speechSent, speechError, ai: getAiLimitStatus() }));
+          return;
+        }
         const limitStatus = getAiLimitStatus();
         if (limitStatus.remaining <= 0) {
           res.writeHead(429, { "Content-Type": "application/json" });
@@ -1834,8 +2166,8 @@ const server = http.createServer((req, res) => {
         return;
       }
       try {
-        await streamTestToneWS(owiSocket, vol);
-        res.end("Test MAX: nada dikirim");
+        await streamAudioToWS(owiSocket, "tts_test.mp3", vol);
+          res.end("Test MAX: audio dikirim");
       } catch (err) {
         res.writeHead(503);
         res.end(err.message);
@@ -1863,6 +2195,32 @@ const server = http.createServer((req, res) => {
     sendCommand(cmd).then(() => res.end("Command " + cmd + " terkirim")).catch((err) => {res.writeHead(500);res.end(err.message);});
     return;
   }
+  if (req.method === "POST" && req.url === "/voice/start") {
+    try {
+      requireOwiSocket().send("CMD:VOICE:START");
+      latestSpeech.voiceStatus = "starting";
+      latestSpeech.voiceTranscript = "";
+      latestSpeech.voiceReply = "";
+      latestSpeech.voiceUpdatedAt = Date.now();
+      res.end("GemBot mulai mendengarkan");
+    } catch (err) {
+      res.writeHead(500);
+      res.end(err.message);
+    }
+    return;
+  }
+  if (req.method === "POST" && req.url === "/voice/stop") {
+    try {
+      requireOwiSocket().send("CMD:VOICE:STOP");
+      latestSpeech.voiceStatus = "thinking";
+      latestSpeech.voiceUpdatedAt = Date.now();
+      res.end("Suara dikirim");
+    } catch (err) {
+      res.writeHead(500);
+      res.end(err.message);
+    }
+    return;
+  }
   if (req.method === "POST" && req.url === "/reminder") {
     const chunks = [];
     req.on("data", (chunk) => chunks.push(chunk));
@@ -1875,7 +2233,7 @@ const server = http.createServer((req, res) => {
             await sendReminderSchedules(data.reminders);
             res.end("Semua reminder tersimpan");
           } else {
-            await sendReminderSchedule(data.time, data.text);
+            await sendReminderSchedule(data.time, data.text, data.date, data.active);
             res.end("Reminder jam tersimpan");
           }
         } else {
@@ -1896,13 +2254,28 @@ const server = http.createServer((req, res) => {
       const body = Buffer.concat(chunks);
       if (body.length !== 9600) {res.writeHead(400);res.end("Frame harus 9600 byte");return}
       try {
-        const framePayload = Buffer.concat([Buffer.from("FRAME:"), body]);
+        const framePayload = body;
         await sendToSerial(framePayload);
-        res.end("Terkirim ke OLED");
+        res.end("Terkirim ke layar");
       } catch (err) {
         res.writeHead(500);
         res.end(err.message);
       }
+    });
+    return;
+  }
+  if (req.method === "POST" && req.url === "/draw_cmds") {
+    let body = "";
+    req.on('data', chunk => body += chunk.toString());
+    req.on('end', () => {
+        try {
+            requireOwiSocket().send("CMD:DRW:" + body);
+            res.writeHead(200);
+            res.end("OK");
+        } catch(e) {
+            res.writeHead(500);
+            res.end(e.message);
+        }
     });
     return;
   }
@@ -1925,6 +2298,23 @@ wss.on('connection', (ws) => {
         return;
       }
       const text = message.toString();
+      
+      if (text.startsWith("CMD:PLAY:")) {
+          const track = text.split(":")[2];
+          logEvent("GemBot requested play track " + track);
+          const file = (track === "1") ? "mbg.mp3" : "lovestory.mp3";
+          if (!isStreamingAudio && owiSocket) {
+             streamAudioToWS(owiSocket, file, "0.30").catch(e => logEvent("Stream err: " + e.message));
+          }
+          return;
+      } else if (text === "CMD:TEST_MAX") {
+          logEvent("GemBot requested TEST_MAX");
+          if (!isStreamingAudio && owiSocket) {
+             streamAudioToWS(owiSocket, "tts_test.mp3", "0.99").catch(e => logEvent("Test stream err: " + e.message));
+          }
+          return;
+      }
+
       let parsed;
       try {
         parsed = JSON.parse(text);
@@ -1934,8 +2324,9 @@ wss.on('connection', (ws) => {
       }
 
       if (parsed.type === "auth" && parsed.role === "owibot") {
-         logEvent("OwiBot Authenticated");
+         logEvent("GemBot Authenticated");
          owiSocket = ws;
+         pushSavedReminderPayload(ws);
       } else if (parsed.event === "start_record") {
          voiceSessions.set(ws, { chunks: [], bytes: 0, sampleRate: 16000, processing: false });
          latestSpeech.voiceStatus = "listening";
@@ -2051,3 +2442,21 @@ server.listen(PORT, () => {
   console.log("Web: http://localhost:" + PORT);
   console.log("Serial: " + SERIAL_PORT + " @ " + BAUD);
 });
+
+setInterval(() => {
+  if (!latestTelemetry || !latestTelemetry.temp) return;
+  const temp = Number(latestTelemetry.temp);
+  if (temp > 32 && Date.now() - lastHeatComplaintTime > 1800000) {
+      lastHeatComplaintTime = Date.now();
+      logEvent("Proactive Heat Trigger triggered (temp=" + temp + ")");
+      synthesizeSpeechFile("Aduh, panas banget ya hari ini! Bikin keringetan.").then(wavPath => {
+          if (wavPath && fs.existsSync(wavPath)) {
+              if (owiSocket && owiSocket.readyState === WebSocket.OPEN) {
+                  owiSocket.send("CMD:M30");
+              }
+              if (serial && serial.isOpen) serial.write("M30\n");
+              if (latestTelemetry.ip) streamAudio(latestTelemetry.ip, "1.0", wavPath);
+          }
+      }).catch(e => console.log("Heat complaint err", e));
+  }
+}, 5000);

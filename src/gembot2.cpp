@@ -63,7 +63,7 @@ volatile uint8_t micSelectedSlot = 0;
 
 RingbufHandle_t audioRingBuf = NULL;
 const size_t RING_BUF_SIZE = 98304;
-const float AI_OUTPUT_GAIN = 0.85f;
+const float AI_OUTPUT_GAIN = 0.70f;
 const int32_t AI_OUTPUT_SOFT_LIMIT = 30000;
 const size_t TTS_PREBUFFER_BYTES = 24000;
 const unsigned long TTS_PREBUFFER_MAX_MS = 2000UL;
@@ -177,10 +177,10 @@ bool dfPlayerReady = false;
 bool dfMusicPlaying = false;
 bool dfMusicPaused = false;
 int dfCurrentTrack = 0;
-int dfVolume = 12;
+int dfVolume = 15;
 int dfAppliedVolume = -1;
 unsigned long lastDfCommandMs = 0;
-const int DFPLAYER_MAX_CLEAN_VOLUME = 15;
+const int DFPLAYER_MAX_CLEAN_VOLUME = 20;
 unsigned long dfTrackStartedMs = 0;
 unsigned long dfPausedAtMs = 0;
 const int dfTrackCount = 4;
@@ -459,7 +459,7 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
           chatTextX = 240;
           isChatActive = true;
           // Play a short SFX
-          setDfVolume(18);
+          setDfVolume(15);
           waitDfCommandGap();
           myDFPlayer.playMp3Folder(2);
         }

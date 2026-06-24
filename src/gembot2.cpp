@@ -516,7 +516,7 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
        currentExpressionId = idStr.toInt();
        manualExpressionUntilMs = millis() + 10000UL;
     } else if (text == "CMD:C" || text == "CMD:CLEAR") {
-       exitDrawMode();
+       enterDrawMode(TFT_BLACK);
     } else if (text == "CMD:P") {
        handleTouchAction(false);
     } else if (text == "CMD:O") {
